@@ -1,4 +1,4 @@
-# <img src="assets/icon.png" height="48" style="vertical-align: -10px;"> MAC-Attention
+# <img src="assets/icon.png" height="48" style="vertical-align: -13px;"> MAC-Attention
 
 **Accepted at MLSys 2026**
 
