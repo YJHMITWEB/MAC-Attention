@@ -1,4 +1,4 @@
-# 🚀 MAC-Attention
+# <img src="assets/icon.png" height="48" style="vertical-align: middle;"> MAC-Attention
 
 **Accepted at MLSys 2026**
 
@@ -6,6 +6,8 @@
 This repository contains the **full reference implementation**, including:
 - MAC “ring match” CUDA extension (`ext/macMatch.cu`)
 - the `mac_attention` Python package (in `attention/`) which JIT-builds the attention + rectification-cache ops
+
+![](assets/workflow.png)
 
 ## Quick Start
 
