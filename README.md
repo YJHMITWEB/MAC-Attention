@@ -5,7 +5,12 @@
 **MAC-Attention** is a high-performance attention mechanism that reduces decoding overhead by **reusing attention computation across semantically similar tokens**.
 This repository contains the **full reference implementation**, including:
 - MAC “ring match” CUDA extension (`ext/macMatch.cu`)
+- MAC prefill cache-update CUDA extension (`ext/mac_prefill_update_cache.cu`)
 - the `mac_attention` Python package (in `attention/`) which JIT-builds the attention + rectification-cache ops
+
+Important note on runtime critical path:
+- **Match + attention** are on the decode critical path.
+- **Prefill cache update** and **rectification+cache** are designed to run **asynchronously** (e.g., on a separate CUDA stream) and are **not on the critical path**.
 
 ![](assets/workflow.png)
 
@@ -32,7 +37,7 @@ python -u e2e_workflow_example.py --steps 1
 ## 🗂️ Project Layout
 
 ```
-opensource/mac_attention/
+MAC-Attention/
 ├── README.md
 ├── attention/                                   # Python package: mac_attention
 │   ├── pyproject.toml
@@ -47,7 +52,9 @@ opensource/mac_attention/
 │       └── _vendor/                             # Vendored CUDA/C++ (flashinfer-based)
 ├── ext/
 │   ├── macMatch.cu                              # Standalone ring match (+ scheduler)
+│   └── mac_prefill_update_cache.cu              # Standalone prefill cache update
 ├── bench_mac_match.py                           # Match benchmark (baseline vs macMatch)
+├── bench_mac_prefill_update_cache.py            # Prefill cache update benchmark
 ├── bench_time_grid_mac_match_plan_attention.py  # Time grid: plan + attention
 ├── bench_time_grid_rectification_cache.py       # Time grid: plan + rectification+cache
 ├── e2e_workflow_example.py                      # End-to-end workflow example
@@ -62,6 +69,7 @@ This repo uses `torch.utils.cpp_extension` and builds CUDA extensions on-demand.
 
 Built via `torch.utils.cpp_extension.load(...)` when you run:
 - `bench_mac_match.py` (builds `ext/macMatch.cu`, and optionally a baseline `.cu`)
+- `bench_mac_prefill_update_cache.py` (builds `ext/mac_prefill_update_cache.cu`)
 - `bench_time_grid_mac_match_plan_attention.py` (builds `ext/macMatch.cu`)
 - `e2e_workflow_example.py` (builds `ext/macMatch.cu`)
 
@@ -133,7 +141,24 @@ Output:
 Notes:
 - `--baseline` is optional and disabled by default.
 
-### 2) Time grid: plan + attention
+### 2) Prefill cache update benchmark
+
+Script: `bench_mac_prefill_update_cache.py`
+
+Measures:
+- prefill cache update time (`avg_us`)
+
+Note: In the full system this is typically launched **asynchronously** and overlapped; its latency is **not** on the decode critical path.
+
+Run:
+```bash
+python -u bench_mac_prefill_update_cache.py
+```
+
+Output:
+- `results/bench_mac_prefill_update_cache_results.csv`
+
+### 3) Time grid: plan + attention
 
 Script: `bench_time_grid_mac_match_plan_attention.py`
 
@@ -149,13 +174,15 @@ python -u bench_time_grid_mac_match_plan_attention.py
 Output:
 - `results/bench_time_grid_mac_match_plan_attention_results.csv`
 
-### 3) Time grid: plan + rectification+cache
+### 4) Time grid: plan + rectification+cache
 
 Script: `bench_time_grid_rectification_cache.py`
 
 Measures:
 - `MACRectificationCacheWithPagedKVCacheWrapper.plan(...)` time (`standalone_plan_time_us`)
 - rectification+cache time (`standalone_macRectificationCache_time_us`)
+
+Note: Rectification+cache is typically launched **asynchronously** and overlapped; it is **not** on the decode critical path.
 
 Run:
 ```bash
@@ -165,7 +192,7 @@ python -u bench_time_grid_rectification_cache.py
 Output:
 - `results/bench_time_grid_rectification_cache_results.csv`
 
-### (Optional) Minimal smoke benchmark
+### 5) (Optional) Minimal smoke benchmark
 
 ```bash
 python -u attention/examples/bench_time_grid_min.py
@@ -186,6 +213,7 @@ Order of operations:
    - inputs: `queries`, paged KV cache, ring caches, and full `(o, lse)`
    - outputs: windowed `(o, lse)` (and updates ring caches)
    - uses a fixed `window_left` (does not depend on previous kernels)
+   - typically launched **asynchronously** and overlapped; **not** on the decode critical path
 
 Run:
 ```bash
