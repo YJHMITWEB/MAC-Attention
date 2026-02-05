@@ -1,0 +1,191 @@
+# 🚀 MAC-Attention
+
+**Accepted at MLSys 2026**
+
+**MAC-Attention** is a high-performance attention mechanism that reduces decoding overhead by **reusing attention computation across semantically similar tokens**.
+This repository contains the **full reference implementation**, including:
+- MAC “ring match” CUDA extension (`ext/macMatch.cu`)
+- the `mac_attention` Python package (in `attention/`) which JIT-builds the attention + rectification-cache ops
+
+## Quick Start
+
+Prereqs:
+- NVIDIA H100 GPUs
+- CUDA 12.8
+- PyTorch with CUDA enabled (`torch.cuda.is_available() == True`)
+
+Install `mac_attention` (editable):
+
+```bash
+python -m pip install -e attention
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+```
+
+Run the end-to-end example (first run will JIT-compile CUDA extensions):
+
+```bash
+python -u e2e_workflow_example.py --steps 1
+```
+
+## 🗂️ Project Layout
+
+```
+opensource/mac_attention/
+├── README.md
+├── attention/                                   # Python package: mac_attention
+│   ├── pyproject.toml
+│   ├── examples/
+│   │   └── bench_time_grid_min.py               # Minimal benchmark for MACDecode
+│   ├── tests/                                   
+│   └── src/mac_attention/
+│       ├── attention/
+│       │   ├── mac_decode.py                    
+│       │   └── mac_rectification_cache.py       
+│       ├── _jit/                                
+│       └── _vendor/                             # Vendored CUDA/C++ (flashinfer-based)
+├── ext/
+│   ├── macMatch.cu                              # Standalone ring match (+ scheduler)
+├── bench_mac_match.py                           # Match benchmark (baseline vs macMatch)
+├── bench_time_grid_mac_match_plan_attention.py  # Time grid: plan + attention
+├── bench_time_grid_rectification_cache.py       # Time grid: plan + rectification+cache
+├── e2e_workflow_example.py                      # End-to-end workflow example
+└── results/                                     # Generated CSVs (created on first run)
+```
+
+## Build / JIT Compilation
+
+This repo uses `torch.utils.cpp_extension` and builds CUDA extensions on-demand.
+
+### 1) Standalone extensions (`ext/`)
+
+Built via `torch.utils.cpp_extension.load(...)` when you run:
+- `bench_mac_match.py` (builds `ext/macMatch.cu`, and optionally a baseline `.cu`)
+- `bench_time_grid_mac_match_plan_attention.py` (builds `ext/macMatch.cu`)
+- `e2e_workflow_example.py` (builds `ext/macMatch.cu`)
+
+Build directory:
+```text
+${MAC_WORKSPACE_BASE:-$HOME}/.cache/mac/torch_extensions
+```
+
+### 2) `mac_attention` package CUDA ops (`attention/`)
+
+Built when calling `.plan(...)` on:
+- `mac_attention.MACDecodeWithPagedKVCacheWrapper`
+- `mac_attention.MACRectificationCacheWithPagedKVCacheWrapper`
+
+Cache root:
+```text
+${MAC_WORKSPACE_BASE:-$HOME}/.cache/mac
+```
+
+Useful knobs:
+```bash
+export MAC_WORKSPACE_BASE=$HOME                           # where to put build artifacts
+export MAC_JIT_VERBOSE=1                                  
+```
+
+Force a clean rebuild:
+```bash
+rm -rf ${MAC_WORKSPACE_BASE:-$HOME}/.cache/mac
+```
+
+## Tests
+
+```bash
+export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+python -m pytest -q attention/tests
+```
+
+## Benchmarks
+
+All scripts write CSVs to `results/` (created automatically).
+
+### 1) Match benchmark (baseline vs macMatch)
+
+Script: `bench_mac_match.py`
+
+What it measures (all in microseconds):
+- schedule time (`*_schedule_us`)
+- kernel time (`*_kernel_us`)
+- total (`*_us = schedule_us + kernel_us`)
+- correctness vs baseline:
+  - exact output equality (`output_correctness`)
+  - winner-distance sanity check (`l2_correctness`)
+
+Default sweep:
+- `R=64`
+- `M ∈ {256,512,1024,2048}`
+- `H ∈ {8,32}`
+- `D=128`
+- `N ∈ {1,2,4,8,16,32}`
+
+Run:
+```bash
+python -u bench_mac_match.py
+```
+
+Output:
+- `results/bench_mac_match_results.csv`
+
+Notes:
+- `--baseline` is optional and disabled by default.
+
+### 2) Time grid: plan + attention
+
+Script: `bench_time_grid_mac_match_plan_attention.py`
+
+Measures:
+- `MACDecodeWithPagedKVCacheWrapper.plan(...)` time (`standalone_plan_time_us`)
+- attention time (`standalone_attn_time_us`)
+
+Run:
+```bash
+python -u bench_time_grid_mac_match_plan_attention.py
+```
+
+Output:
+- `results/bench_time_grid_mac_match_plan_attention_results.csv`
+
+### 3) Time grid: plan + rectification+cache
+
+Script: `bench_time_grid_rectification_cache.py`
+
+Measures:
+- `MACRectificationCacheWithPagedKVCacheWrapper.plan(...)` time (`standalone_plan_time_us`)
+- rectification+cache time (`standalone_macRectificationCache_time_us`)
+
+Run:
+```bash
+python -u bench_time_grid_rectification_cache.py
+```
+
+Output:
+- `results/bench_time_grid_rectification_cache_results.csv`
+
+### (Optional) Minimal smoke benchmark
+
+```bash
+python -u attention/examples/bench_time_grid_min.py
+```
+
+## End-to-End Workflow Example
+
+Script: `e2e_workflow_example.py`
+
+Order of operations:
+1) **mac match** (`ext/macMatch.cu`)
+   - inputs: `queries`, `query_cache`
+   - outputs: `hit`, `left`, `idx`
+2) **mac attention** (`MACDecodeWithPagedKVCacheWrapper`)
+   - inputs: `queries`, paged KV cache, ring `attn_cache`/`lse_cache`, and `attn_start_pos = left`
+   - outputs: full `(o, lse)`
+3) **macRectificationCache** (`MACRectificationCacheWithPagedKVCacheWrapper`)
+   - inputs: `queries`, paged KV cache, ring caches, and full `(o, lse)`
+   - outputs: windowed `(o, lse)` (and updates ring caches)
+   - uses a fixed `window_left` (does not depend on previous kernels)
+
+Run:
+```bash
+python -u e2e_workflow_example.py --steps 2
+```

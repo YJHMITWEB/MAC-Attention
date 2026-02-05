@@ -1,0 +1,34 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+
+# Packaging / builds
+*.egg-info/
+.eggs/
+build/
+dist/
+wheelhouse/
+
+# Compiled artifacts
+*.so
+*.dylib
+*.dll
+*.o
+*.a
+*.obj
+
+# Benchmark outputs
+results/*
+!results/.gitkeep
+*.csv
+
+# Logs / profiling
+*.log
+*.ncu-rep
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/
