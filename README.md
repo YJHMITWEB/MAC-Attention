@@ -1,6 +1,6 @@
 # <img src="assets/icon.png" height="48" style="vertical-align: -13px;"> MAC-Attention
 
-**Accepted at MLSys 2026**
+🎓**Accepted at MLSys 2026**🎓
 
 **MAC-Attention** is a high-performance attention mechanism that reduces decoding overhead by **reusing attention computation across semantically similar tokens**.
 This repository contains the **full reference implementation**, including:
@@ -14,7 +14,7 @@ Important note on runtime critical path:
 
 ![](assets/workflow.png)
 
-## Quick Start
+## 🚀 Quick Start
 
 Prereqs:
 - NVIDIA H100 GPUs
@@ -61,7 +61,7 @@ MAC-Attention/
 └── results/                                     # Generated CSVs (created on first run)
 ```
 
-## Build / JIT Compilation
+## 🛠️ Build / JIT Compilation
 
 This repo uses `torch.utils.cpp_extension` and builds CUDA extensions on-demand.
 
@@ -100,14 +100,14 @@ Force a clean rebuild:
 rm -rf ${MAC_WORKSPACE_BASE:-$HOME}/.cache/mac
 ```
 
-## Tests
+## 🧪 Sanity Check
 
 ```bash
 export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
 python -m pytest -q attention/tests
 ```
 
-## Benchmarks
+## 📊 Benchmarks
 
 All scripts write CSVs to `results/` (created automatically).
 
@@ -198,7 +198,7 @@ Output:
 python -u attention/examples/bench_time_grid_min.py
 ```
 
-## End-to-End Workflow Example
+## 🔄 End-to-End Workflow Example
 
 Script: `e2e_mac_workflow_example.py`
 
