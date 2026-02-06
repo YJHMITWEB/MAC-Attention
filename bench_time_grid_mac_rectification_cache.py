@@ -71,7 +71,7 @@ def main() -> None:
 
     out_dir = Path(__file__).resolve().parent / "results"
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_csv = out_dir / "bench_time_grid_rectification_cache_results.csv"
+    out_csv = out_dir / "bench_time_grid_mac_rectification_cache_results.csv"
 
     fieldnames = [
         "batch_size",

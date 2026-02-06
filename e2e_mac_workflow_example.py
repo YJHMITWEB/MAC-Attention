@@ -50,7 +50,7 @@ def _match_schedule(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser("End-to-end mac_attention workflow example")
+    ap = argparse.ArgumentParser("End-to-end MAC-Attention workflow example")
     ap.add_argument("--batch", type=int, default=4, help="B (#queries)")
     ap.add_argument("--Hq", type=int, default=8, help="#Q heads")
     ap.add_argument("--Hkv", type=int, default=2, help="#KV heads")

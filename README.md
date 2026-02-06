@@ -31,7 +31,7 @@ python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda
 Run the end-to-end example (first run will JIT-compile CUDA extensions):
 
 ```bash
-python -u e2e_workflow_example.py --steps 1
+python -u e2e_mac_workflow_example.py --steps 1
 ```
 
 ## 🗂️ Project Layout
@@ -56,8 +56,8 @@ MAC-Attention/
 ├── bench_mac_match.py                           # Match benchmark (baseline vs macMatch)
 ├── bench_mac_prefill_update_cache.py            # Prefill cache update benchmark
 ├── bench_time_grid_mac_match_plan_attention.py  # Time grid: plan + attention
-├── bench_time_grid_rectification_cache.py       # Time grid: plan + rectification+cache
-├── e2e_workflow_example.py                      # End-to-end workflow example
+├── bench_time_grid_mac_rectification_cache.py   # Time grid: plan + rectification+cache
+├── e2e_mac_workflow_example.py                  # End-to-end workflow example
 └── results/                                     # Generated CSVs (created on first run)
 ```
 
@@ -71,7 +71,7 @@ Built via `torch.utils.cpp_extension.load(...)` when you run:
 - `bench_mac_match.py` (builds `ext/macMatch.cu`, and optionally a baseline `.cu`)
 - `bench_mac_prefill_update_cache.py` (builds `ext/mac_prefill_update_cache.cu`)
 - `bench_time_grid_mac_match_plan_attention.py` (builds `ext/macMatch.cu`)
-- `e2e_workflow_example.py` (builds `ext/macMatch.cu`)
+- `e2e_mac_workflow_example.py` (builds `ext/macMatch.cu`)
 
 Build directory:
 ```text
@@ -176,7 +176,7 @@ Output:
 
 ### 4) Time grid: plan + rectification+cache
 
-Script: `bench_time_grid_rectification_cache.py`
+Script: `bench_time_grid_mac_rectification_cache.py`
 
 Measures:
 - `MACRectificationCacheWithPagedKVCacheWrapper.plan(...)` time (`standalone_plan_time_us`)
@@ -186,11 +186,11 @@ Note: Rectification+cache is typically launched **asynchronously** and overlappe
 
 Run:
 ```bash
-python -u bench_time_grid_rectification_cache.py
+python -u bench_time_grid_mac_rectification_cache.py
 ```
 
 Output:
-- `results/bench_time_grid_rectification_cache_results.csv`
+- `results/bench_time_grid_mac_rectification_cache_results.csv`
 
 ### 5) (Optional) Minimal smoke benchmark
 
@@ -200,7 +200,7 @@ python -u attention/examples/bench_time_grid_min.py
 
 ## End-to-End Workflow Example
 
-Script: `e2e_workflow_example.py`
+Script: `e2e_mac_workflow_example.py`
 
 Order of operations:
 1) **mac match** (`ext/macMatch.cu`)
@@ -217,5 +217,5 @@ Order of operations:
 
 Run:
 ```bash
-python -u e2e_workflow_example.py --steps 2
+python -u e2e_mac_workflow_example.py --steps 2
 ```
