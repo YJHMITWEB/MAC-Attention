@@ -1,0 +1,102 @@
+name: Archive GitHub Traffic
+
+on:
+  schedule:
+    # Runs daily at 02:15 UTC (adjust if needed)
+    - cron: "15 2 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch traffic (views + clones)
+        env:
+          GH_TOKEN: ${{ secrets.GH_TRAFFIC_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          mkdir -p analytics/tmp
+
+          api="https://api.github.com/repos/${OWNER}/${REPO}"
+          hdr=(-H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${GH_TOKEN}")
+
+          curl -sS "${hdr[@]}" "${api}/traffic/views?per=day"  > analytics/tmp/views.json
+          curl -sS "${hdr[@]}" "${api}/traffic/clones?per=day" > analytics/tmp/clones.json
+
+      - name: Merge into long-term CSV (dedupe by date)
+        run: |
+          set -euo pipefail
+          python - << 'PY'
+          import csv, json, os
+          from datetime import datetime
+
+          os.makedirs("analytics", exist_ok=True)
+          out_csv = "analytics/traffic_daily.csv"
+
+          views = json.load(open("analytics/tmp/views.json"))
+          clones = json.load(open("analytics/tmp/clones.json"))
+
+          # API returns daily timestamps (usually ISO8601); normalize to UTC date.
+          def to_day(ts: str) -> str:
+            # Example: 2026-02-06T00:00:00Z
+            return ts[:10]
+
+          daily = {}
+          # Read existing history.
+          if os.path.exists(out_csv):
+            with open(out_csv, newline="") as f:
+              r = csv.DictReader(f)
+              for row in r:
+                daily[row["date"]] = row
+
+          # Upsert latest 14-day values from GitHub as source of truth.
+          for item in views.get("views", []):
+            d = to_day(item["timestamp"])
+            row = daily.get(d, {"date": d})
+            row["views"] = str(item.get("count", 0))
+            row["unique_visitors"] = str(item.get("uniques", 0))
+            daily[d] = row
+
+          for item in clones.get("clones", []):
+            d = to_day(item["timestamp"])
+            row = daily.get(d, {"date": d})
+            row["clones"] = str(item.get("count", 0))
+            row["unique_cloners"] = str(item.get("uniques", 0))
+            daily[d] = row
+
+          # Write sorted output by date.
+          fields = ["date", "views", "unique_visitors", "clones", "unique_cloners"]
+          rows = [daily[k] for k in sorted(daily.keys())]
+
+          with open(out_csv, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fields)
+            w.writeheader()
+            for r in rows:
+              # Fill missing fields with 0 to avoid empty cells.
+              for fld in fields:
+                r.setdefault(fld, "0")
+              w.writerow({fld: r[fld] for fld in fields})
+
+          print(f"Wrote {out_csv} with {len(rows)} rows")
+          PY
+
+      - name: Commit changes
+        run: |
+          set -euo pipefail
+          if git status --porcelain | grep -q .; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add analytics/traffic_daily.csv
+            git commit -m "chore: archive GitHub traffic"
+            git push
+          else
+            echo "No changes"
+          fi
