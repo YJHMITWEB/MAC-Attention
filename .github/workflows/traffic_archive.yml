@@ -1,19 +1,18 @@
-name: Archive GitHub Traffic
+name: Archive GitHub Traffic (private sink)
 
 on:
   schedule:
-    # Runs daily at 02:15 UTC (adjust if needed)
     - cron: "15 2 * * *"
   workflow_dispatch: {}
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   archive:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout source repo
         uses: actions/checkout@v4
 
       - name: Fetch traffic (views + clones)
@@ -31,12 +30,11 @@ jobs:
           curl -sS "${hdr[@]}" "${api}/traffic/views?per=day"  > analytics/tmp/views.json
           curl -sS "${hdr[@]}" "${api}/traffic/clones?per=day" > analytics/tmp/clones.json
 
-      - name: Merge into long-term CSV (dedupe by date)
+      - name: Build daily CSV (in workspace)
         run: |
           set -euo pipefail
           python - << 'PY'
           import csv, json, os
-          from datetime import datetime
 
           os.makedirs("analytics", exist_ok=True)
           out_csv = "analytics/traffic_daily.csv"
@@ -44,58 +42,98 @@ jobs:
           views = json.load(open("analytics/tmp/views.json"))
           clones = json.load(open("analytics/tmp/clones.json"))
 
-          # API returns daily timestamps (usually ISO8601); normalize to UTC date.
           def to_day(ts: str) -> str:
-            # Example: 2026-02-06T00:00:00Z
-            return ts[:10]
+            return ts[:10]  # UTC day
 
-          daily = {}
-          # Read existing history.
-          if os.path.exists(out_csv):
-            with open(out_csv, newline="") as f:
-              r = csv.DictReader(f)
-              for row in r:
-                daily[row["date"]] = row
+          # Build only the current 14-day API window.
+          tmp = {}
 
-          # Upsert latest 14-day values from GitHub as source of truth.
           for item in views.get("views", []):
             d = to_day(item["timestamp"])
-            row = daily.get(d, {"date": d})
+            row = tmp.get(d, {"date": d})
             row["views"] = str(item.get("count", 0))
             row["unique_visitors"] = str(item.get("uniques", 0))
-            daily[d] = row
+            tmp[d] = row
 
           for item in clones.get("clones", []):
             d = to_day(item["timestamp"])
-            row = daily.get(d, {"date": d})
+            row = tmp.get(d, {"date": d})
             row["clones"] = str(item.get("count", 0))
             row["unique_cloners"] = str(item.get("uniques", 0))
-            daily[d] = row
+            tmp[d] = row
 
-          # Write sorted output by date.
           fields = ["date", "views", "unique_visitors", "clones", "unique_cloners"]
-          rows = [daily[k] for k in sorted(daily.keys())]
+          rows = [tmp[k] for k in sorted(tmp.keys())]
 
           with open(out_csv, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=fields)
             w.writeheader()
             for r in rows:
-              # Fill missing fields with 0 to avoid empty cells.
               for fld in fields:
                 r.setdefault(fld, "0")
               w.writerow({fld: r[fld] for fld in fields})
 
-          print(f"Wrote {out_csv} with {len(rows)} rows")
+          print(f"Wrote {out_csv} with {len(rows)} rows (last 14d window)")
           PY
 
-      - name: Commit changes
+      - name: Push/merge into private data repo
+        env:
+          PUSH_TOKEN: ${{ secrets.TRAFFIC_PUSH_TOKEN }}
+          DATA_REPO: YJHMITWEB/repo-traffic-private
+          SOURCE_REPO: ${{ github.repository }}
+          HIST: ${{ format('sink/{0}/analytics/traffic_daily.csv', github.repository) }}
+          NEW: analytics/traffic_daily.csv
         run: |
           set -euo pipefail
+
+          rm -rf sink
+          git clone "https://x-access-token:${PUSH_TOKEN}@github.com/${DATA_REPO}.git" sink
+
+          mkdir -p "sink/${SOURCE_REPO}/analytics"
+
+          python - << 'PY'
+          import csv, os
+
+          hist = os.environ["HIST"]
+          newf = os.environ["NEW"]
+
+          def read_csv(path):
+            if not os.path.exists(path):
+              return {}
+            with open(path, newline="") as f:
+              r = csv.DictReader(f)
+              return {row["date"]: row for row in r}
+
+          h = read_csv(hist)
+          n = read_csv(newf)
+          h.update(n)
+
+          fields = ["date", "views", "unique_visitors", "clones", "unique_cloners"]
+          rows = [h[k] for k in sorted(h.keys())]
+
+          os.makedirs(os.path.dirname(hist), exist_ok=True)
+          with open(hist, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fields)
+            w.writeheader()
+            for row in rows:
+              for fld in fields:
+                row.setdefault(fld, "0")
+              w.writerow({fld: row[fld] for fld in fields})
+
+          print(f"Merged -> {hist} rows={len(rows)}")
+          PY
+
+      - name: Commit & push data repo
+        env:
+          DATA_REPO: YJHMITWEB/repo-traffic-private
+        run: |
+          set -euo pipefail
+          cd sink
           if git status --porcelain | grep -q .; then
             git config user.name  "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add analytics/traffic_daily.csv
-            git commit -m "chore: archive GitHub traffic"
+            git add .
+            git commit -m "archive traffic: ${GITHUB_REPOSITORY}"
             git push
           else
             echo "No changes"
