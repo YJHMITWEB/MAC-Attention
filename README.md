@@ -2,6 +2,8 @@
 
 🎓**Accepted at MLSys 2026**🎓
 
+📄 **Paper:** [arXiv:2604.00235](https://arxiv.org/abs/2604.00235)
+
 **MAC-Attention** is a high-performance attention mechanism that reduces decoding overhead by **reusing attention computation across semantically similar tokens**.
 This repository contains the **full reference implementation**, including:
 - MAC “ring match” CUDA extension (`ext/macMatch.cu`)
