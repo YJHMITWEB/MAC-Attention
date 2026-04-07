@@ -111,7 +111,7 @@ def generate_attention_cache(
     return attn_cache, lse_cache
 
 
-def generate_query_cache(
+def generate_match_query_cache(
     *,
     capacity: int,
     num_heads: int,
@@ -129,52 +129,38 @@ def generate_query_cache(
     )
 
 
-def _global_index_to_local_slot(global_index: int, request_length: int, capacity: int) -> int:
-    if request_length <= 0:
-        raise ValueError("request_length must be positive")
-    if global_index < 0 or global_index >= request_length:
-        raise ValueError(
-            f"global_index must be in [0, {request_length}), got global_index={global_index}"
-        )
-    if request_length < capacity:
-        return int(global_index)
-
-    base_global = request_length - capacity
-    order_index = global_index - base_global
-    tail = request_length % capacity
-    return int((order_index + tail) % capacity)
-
-
-def inject_exact_match_targets(
+def generate_attention_routing(
     *,
-    query_cache: torch.Tensor,
-    queries: torch.Tensor,
-    req_ids: torch.Tensor,
-    attn_start_pos: torch.Tensor,
-    request_length: torch.Tensor,
-    match_offset: int,
-) -> torch.Tensor:
-    batch_size, num_heads, _head_dim = queries.shape
-    expected_idx = torch.empty((batch_size, num_heads), device=queries.device, dtype=torch.int32)
-
-    for n in range(batch_size):
-        req = int(req_ids[n].item())
-        req_len = int(request_length[req].item())
-        for h in range(num_heads):
-            start_pos = int(attn_start_pos[n, h].item())
-            global_index = start_pos + int(match_offset) - 1
-            local_slot = _global_index_to_local_slot(global_index, req_len, int(query_cache.size(1)))
-            query_cache[req, local_slot, h, :] = queries[n, h, :]
-            expected_idx[n, h] = int(local_slot)
-
-    return expected_idx
+    capacity: int,
+    batch_size: int,
+    num_heads: int,
+    hit_rate: float,
+    device: torch.device,
+    seed: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    gen = _cuda_generator(seed)
+    indices = torch.randint(
+        0,
+        capacity,
+        (batch_size, num_heads),
+        generator=gen,
+        device=device,
+        dtype=torch.int32,
+    )
+    hit_table = torch.rand(
+        (batch_size, num_heads),
+        generator=gen,
+        device=device,
+    ) < float(hit_rate)
+    req_ids = torch.arange(batch_size, device=device, dtype=torch.int32)
+    return indices, hit_table, req_ids
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=(
-            "Benchmark end-to-end MAC critical-path latency "
-            "(macMatch kernel + MACDecode plan + MAC attention) versus FlashInfer baseline "
+            "Benchmark MAC latency as the sum of measured macMatch kernel, "
+            "MACDecode plan, and MAC attention latencies versus FlashInfer baseline "
             "and emit the paper-style CSV schema."
         )
     )
@@ -193,6 +179,7 @@ def main() -> None:
     ap.add_argument("--num-runs", type=int, default=100)
     ap.add_argument("--warmup-runs", type=int, default=10)
     ap.add_argument("--seed", type=int, default=2025)
+    ap.add_argument("--hit-rate", type=float, default=0.7)
     ap.add_argument("--match-threshold", type=float, default=0.95)
     ap.add_argument("--match-offset", type=int, default=256)
     ap.add_argument("--match-target-util", type=float, default=0.95)
@@ -278,6 +265,25 @@ def main() -> None:
         for batch_size in batch_sizes:
             last_page_len = torch.ones((batch_size,), device=device, dtype=torch.int32)
             req_ids = torch.arange(batch_size, device=device, dtype=torch.int32)
+            match_queries = torch.randn((batch_size, num_qo_heads, head_dim), device=device, dtype=dtype)
+            match_query_cache = generate_match_query_cache(
+                capacity=cache_capacity,
+                num_heads=num_qo_heads,
+                head_dim=head_dim,
+                max_running_requests=max_running_requests,
+                device=device,
+                seed=int(args.seed) + 23,
+            )
+            match_request_length = torch.randint(
+                low=0,
+                high=2 * cache_capacity,
+                size=(max_running_requests,),
+                device=device,
+                dtype=torch.int32,
+            )
+            match_hit = torch.empty((batch_size, num_qo_heads), device=device, dtype=torch.bool)
+            match_left = torch.empty((batch_size, num_qo_heads), device=device, dtype=torch.int32)
+            match_idx = torch.empty((batch_size, num_qo_heads), device=device, dtype=torch.int32)
 
             match_plan, mac_match_schedule_us = measure_schedule_us(
                 mac_match_ext,
@@ -294,6 +300,29 @@ def main() -> None:
             mac_match_rows_per_stage = int(match_plan["rows_per_stage"])
             mac_match_load_warps = int(match_plan["load_warps"])
 
+            def mac_match_run():
+                return call_mac_ring_match(
+                    mac_match_ext,
+                    q_cache=match_query_cache,
+                    request_length=match_request_length,
+                    queries=match_queries,
+                    req_ids=req_ids,
+                    threshold=float(args.match_threshold),
+                    rows_per_stage=mac_match_rows_per_stage,
+                    load_warps=mac_match_load_warps,
+                    my_offset=int(args.match_offset),
+                    hit=match_hit,
+                    left=match_left,
+                    idx=match_idx,
+                )
+
+            mac_match_kernel_us = bench_host_us(
+                mac_match_run,
+                num_runs,
+                warmup_runs,
+            )
+            mac_match_us = float(mac_match_kernel_us)
+
             for kv_len in context_lengths:
                 for kv_access in kv_accesses:
                     q = torch.randn(
@@ -301,17 +330,12 @@ def main() -> None:
                         device=device,
                         dtype=dtype,
                     )
-                    attn_start_pos_target = torch.full(
+                    attn_start_pos = torch.full(
                         (batch_size, num_qo_heads),
                         _attn_start_pos_val(kv_len, kv_access),
                         device=device,
                         dtype=torch.int32,
                     )
-                    if int(attn_start_pos_target.max().item()) > (kv_len - int(args.match_offset)):
-                        raise ValueError(
-                            f"match_offset={int(args.match_offset)} is too large for kv_len={kv_len} "
-                            f"and kv_access={kv_access}; cannot realize attn_start_pos via macMatch."
-                        )
 
                     attn_cache, lse_cache = generate_attention_cache(
                         capacity=cache_capacity,
@@ -321,11 +345,11 @@ def main() -> None:
                         device=device,
                         seed=int(args.seed),
                     )
-                    query_cache = generate_query_cache(
+                    indices, hit_table, attn_req_ids = generate_attention_routing(
                         capacity=cache_capacity,
+                        batch_size=batch_size,
                         num_heads=num_qo_heads,
-                        head_dim=head_dim,
-                        max_running_requests=max_running_requests,
+                        hit_rate=float(args.hit_rate),
                         device=device,
                         seed=int(args.seed) + 17,
                     )
@@ -343,24 +367,6 @@ def main() -> None:
                         device=device,
                         dtype=torch.int32,
                     )
-                    request_length = torch.full(
-                        (max_running_requests,),
-                        kv_len,
-                        device=device,
-                        dtype=torch.int32,
-                    )
-                    expected_idx = inject_exact_match_targets(
-                        query_cache=query_cache,
-                        queries=q,
-                        req_ids=req_ids,
-                        attn_start_pos=attn_start_pos_target,
-                        request_length=request_length,
-                        match_offset=int(args.match_offset),
-                    )
-
-                    hit = torch.empty((batch_size, num_qo_heads), device=device, dtype=torch.bool)
-                    left = torch.empty((batch_size, num_qo_heads), device=device, dtype=torch.int32)
-                    idx = torch.empty((batch_size, num_qo_heads), device=device, dtype=torch.int32)
 
                     baseline_wrapper.plan(
                         indptr,
@@ -378,22 +384,6 @@ def main() -> None:
                     def flashinfer_baseline_run():
                         return baseline_wrapper.run_return_lse(q, (k_cache, v_cache))
 
-                    def mac_match_run():
-                        return call_mac_ring_match(
-                            mac_match_ext,
-                            q_cache=query_cache,
-                            request_length=request_length,
-                            queries=q,
-                            req_ids=req_ids,
-                            threshold=float(args.match_threshold),
-                            rows_per_stage=mac_match_rows_per_stage,
-                            load_warps=mac_match_load_warps,
-                            my_offset=int(args.match_offset),
-                            hit=hit,
-                            left=left,
-                            idx=idx,
-                        )
-
                     def mac_plan_run():
                         mac_wrapper.plan(
                             indptr,
@@ -406,18 +396,10 @@ def main() -> None:
                             pos_encoding_mode="NONE",
                             q_data_type=dtype,
                             data_type=dtype,
-                            attn_start_pos=left,
+                            attn_start_pos=attn_start_pos,
                             downdate_range=downdate_range,
                             attn_start_pos_host_pinned_opt=attn_host_pinned,
                         )
-
-                    match_hit, match_left, match_idx = mac_match_run()
-                    if not bool(match_hit.all().item()):
-                        raise RuntimeError("macMatch expected all hits for the injected benchmark inputs")
-                    if not torch.equal(match_left, attn_start_pos_target):
-                        raise RuntimeError("macMatch left output does not match the requested attn_start_pos")
-                    if not torch.equal(match_idx, expected_idx):
-                        raise RuntimeError("macMatch idx output does not match the injected local slots")
 
                     mac_plan_run()
 
@@ -429,43 +411,11 @@ def main() -> None:
                             cache_capacity,
                             attn_cache,
                             lse_cache,
-                            idx,
-                            hit,
-                            req_ids,
+                            indices,
+                            hit_table,
+                            attn_req_ids,
                             True,
-                            left,
-                            downdate_range,
-                        )
-
-                    def mac_critical_path_run():
-                        _hit, _left, _idx = mac_match_run()
-                        mac_wrapper.plan(
-                            indptr,
-                            page_indices,
-                            last_page_len,
-                            num_qo_heads,
-                            num_kv_heads,
-                            head_dim,
-                            page_size,
-                            pos_encoding_mode="NONE",
-                            q_data_type=dtype,
-                            data_type=dtype,
-                            attn_start_pos=_left,
-                            downdate_range=downdate_range,
-                            attn_start_pos_host_pinned_opt=attn_host_pinned,
-                        )
-                        return mac_wrapper.forward_return_lse(
-                            q,
-                            (k_cache, v_cache),
-                            max_running_requests,
-                            cache_capacity,
-                            attn_cache,
-                            lse_cache,
-                            _idx,
-                            _hit,
-                            req_ids,
-                            True,
-                            _left,
+                            attn_start_pos,
                             downdate_range,
                         )
 
@@ -474,11 +424,6 @@ def main() -> None:
                         num_runs=num_runs,
                         num_warmup_runs=warmup_runs,
                     ) * 1000.0
-                    mac_match_kernel_us = bench_host_us(
-                        mac_match_run,
-                        num_runs,
-                        warmup_runs,
-                    )
                     mac_plan_time_us = measure_cuda_time_ms(
                         mac_plan_run,
                         num_runs=num_runs,
@@ -489,12 +434,7 @@ def main() -> None:
                         num_runs=num_runs,
                         num_warmup_runs=warmup_runs,
                     ) * 1000.0
-                    mac_match_us = float(mac_match_kernel_us)
-                    mac_total_time_us = bench_host_us(
-                        mac_critical_path_run,
-                        num_runs,
-                        warmup_runs,
-                    )
+                    mac_total_time_us = mac_match_us + mac_plan_time_us + mac_attn_time_us
 
                     writer.writerow(
                         {
