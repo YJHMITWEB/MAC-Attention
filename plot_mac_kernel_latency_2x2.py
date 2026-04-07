@@ -353,7 +353,7 @@ def plot_one_subfigure(ax, fig_spec: Dict) -> None:
         order = ["MAC Perfect", "MAC w.LB", "MAC w.o. LB"]
         series_colors = {
             "MAC Perfect": ACCENT_A,
-            "MAC w.LB": "#10A37F",
+            "MAC w.LB": "#FFB3C1",
             "MAC w.o. LB": ACCENT_B,
         }
         flat_series = []
