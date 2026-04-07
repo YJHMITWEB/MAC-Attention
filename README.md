@@ -179,7 +179,7 @@ Script: `bench_mac_kernel_latency_2x2.py`
 
 Measures:
 - panel **(a)**: `macMatch` kernel latency vs `flashinfer` decode-kernel latency
-- panel **(b)**: load-balance planner study (`MAC Perfect`, `MAC w.LB`, `MAC w.o. LB`)
+- panel **(b)**: load-balance planner study using **attention-kernel latency only** (`MAC Perfect`, `MAC w.LB`, `MAC w.o. LB`)
 - panels **(c)** and **(d)**: MAC breakdown (`Match`, `Plan`, `Attention`) vs full-attention baseline
 
 Default setup:
@@ -195,6 +195,7 @@ Default setup:
   - `MAC Perfect`: uniform KV access ratio `sigma`
   - `MAC w.LB`: per-head KV access ratio sampled from `Normal(mean=sigma, std=sigma)` and clamped to `[0,1]`
   - `MAC w.o. LB`: worst-case uniform KV access ratio `min(1, sigma + sigma)`
+  - the plotted bars use `*_attn_us` only; planner latency is still emitted in the CSV for reference
 - panels **(c)** and **(d)**:
   - contexts: `32K, 64K, 128K`
   - skip ratios: `0.99, 0.90, 0.80`

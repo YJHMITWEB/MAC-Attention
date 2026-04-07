@@ -178,9 +178,9 @@ def load_panel_b_spec(csv_path: str) -> Dict:
         [
             "context_length",
             "sigma",
-            "mac_perfect_total_us",
-            "mac_lb_total_us",
-            "mac_no_lb_total_us",
+            "mac_perfect_attn_us",
+            "mac_lb_attn_us",
+            "mac_no_lb_attn_us",
         ],
         csv_path,
     )
@@ -197,9 +197,9 @@ def load_panel_b_spec(csv_path: str) -> Dict:
             if row_df.empty:
                 raise ValueError(f"{csv_path} is missing context={context_length} sigma={sigma}")
             row = row_df.iloc[0]
-            perfect_vals.append(float(row["mac_perfect_total_us"]))
-            lb_vals.append(float(row["mac_lb_total_us"]))
-            no_lb_vals.append(float(row["mac_no_lb_total_us"]))
+            perfect_vals.append(float(row["mac_perfect_attn_us"]))
+            lb_vals.append(float(row["mac_lb_attn_us"]))
+            no_lb_vals.append(float(row["mac_no_lb_attn_us"]))
         groups.append(
             {
                 "name": f"Context {context_length // 1024}K",
