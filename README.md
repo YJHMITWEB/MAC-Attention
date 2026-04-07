@@ -57,9 +57,11 @@ MAC-Attention/
 │   └── mac_prefill_update_cache.cu              # Standalone prefill cache update
 ├── bench_mac_match.py                           # Match benchmark (baseline vs macMatch)
 ├── bench_mac_prefill_update_cache.py            # Prefill cache update benchmark
+├── bench_time_grid_mac_attention_speedup.py     # Paper-style sweep: MAC attention vs FlashInfer
 ├── bench_time_grid_mac_match_plan_attention.py  # Time grid: plan + attention
 ├── bench_time_grid_mac_rectification_cache.py   # Time grid: plan + rectification+cache
 ├── e2e_mac_workflow_example.py                  # End-to-end workflow example
+├── plot_attn_speedup.py                         # Shared-axis speedup figure from benchmark CSV
 └── results/                                     # Generated CSVs (created on first run)
 ```
 
@@ -176,7 +178,56 @@ python -u bench_time_grid_mac_match_plan_attention.py
 Output:
 - `results/bench_time_grid_mac_match_plan_attention_results.csv`
 
-### 4) Time grid: plan + rectification+cache
+### 4) Paper-style attention speedup benchmark
+
+Script: `bench_time_grid_mac_attention_speedup.py`
+
+Measures:
+- `mac_match_schedule_us`
+- `mac_match_kernel_us`
+- `mac_match_us`
+- `mac_plan_time_us`
+- `mac_attn_time_us`
+- `mac_total_time_us`
+- `flashinfer_baseline_time_us`
+
+Output schema:
+- `batch_size`
+- `context_length`
+- `KV_Access`
+- `mac_match_rows_per_stage`
+- `mac_match_load_warps`
+- `mac_match_schedule_us`
+- `mac_match_kernel_us`
+- `mac_match_us`
+- `mac_plan_time_us`
+- `mac_attn_time_us`
+- `mac_total_time_us`
+- `flashinfer_baseline_time_us`
+
+Notes:
+- This benchmark requires the `flashinfer` Python package for the baseline path.
+- It uses the same sweep shape as the paper benchmark: `batch_size in {1,2,4,8,16,32,64}`, `context_length in {32768,65536,131072,262144}`, `KV_Access in {0.01,0.05,0.1,0.2,0.3,0.4}`.
+- The plot uses `mac_total_time_us` as the end-to-end MAC critical-path latency.
+- `mac_match_schedule_us` is emitted for visibility, but the plotted critical path follows the e2e workflow example and uses match kernel + plan + attention.
+
+Run:
+```bash
+python -u bench_time_grid_mac_attention_speedup.py
+```
+
+Output:
+- `results/bench_time_grid_results.csv`
+
+Plot:
+```bash
+python -u plot_attn_speedup.py
+```
+
+Figure:
+- `results/attn_speedup_row_from_csv_sharedaxes.pdf`
+
+### 5) Time grid: plan + rectification+cache
 
 Script: `bench_time_grid_mac_rectification_cache.py`
 
@@ -194,7 +245,7 @@ python -u bench_time_grid_mac_rectification_cache.py
 Output:
 - `results/bench_time_grid_mac_rectification_cache_results.csv`
 
-### 5) (Optional) Minimal smoke benchmark
+### 6) (Optional) Minimal smoke benchmark
 
 ```bash
 python -u attention/examples/bench_time_grid_min.py
