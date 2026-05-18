@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mac-attention"
+version = "0.1.0"
+description = "Portable MAC-Attention plugin and CUDA kernels for SGLang long-context decoding"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [{name = "MAC-Attention Contributors"}]
+dependencies = []
+
+[tool.setuptools]
+package-dir = {"" = "attention/src"}
+
+[tool.setuptools.packages.find]
+where = ["attention/src"]
+
+[tool.setuptools.package-data]
+"mac_attention.integrations.sglang" = ["csrc/*.cu"]
+
+[tool.pytest.ini_options]
+testpaths = ["attention/tests"]
+pythonpath = ["attention/src", "attention"]

@@ -1,34 +1,21 @@
-# Python bytecode / caches
 __pycache__/
-*.py[cod]
-*.pyd
+*.pyc
 .pytest_cache/
-
-# Packaging / builds
-*.egg-info/
-.eggs/
+.ruff_cache/
+.cache/
 build/
 dist/
-wheelhouse/
-
-# Compiled artifacts
+*.egg-info/
 *.so
-*.dylib
-*.dll
 *.o
 *.a
-*.obj
-
-# Benchmark outputs
-results/*
-!results/.gitkeep
-*.csv
-
-# Logs / profiling
-*.log
+*.tmp
+*.swp
+.venv/
+results/
+profiles/
 *.ncu-rep
-
-# Editors / OS
-.DS_Store
-.vscode/
-.idea/
+*.nsys-rep
+*.qdrep
+*.sqlite
+*.log
