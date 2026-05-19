@@ -2,20 +2,14 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-OPENSOURCE_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
-DEFAULT_MINORTEST_DIR="$(cd -- "$OPENSOURCE_DIR/.." && pwd)"
-if [[ -d "$OPENSOURCE_DIR/benchmark/LongBench" ]]; then
-  DEFAULT_MINORTEST_DIR="$OPENSOURCE_DIR"
-fi
-export MINORTEST_DIR="${MINORTEST_DIR:-$DEFAULT_MINORTEST_DIR}"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+export MAC_ATTENTION_REPO_ROOT="${MAC_ATTENTION_REPO_ROOT:-$REPO_ROOT}"
 
 if [[ -z "${MAC_ATTENTION_ROOT:-}" ]]; then
-  if [[ -d "$OPENSOURCE_DIR/attention" ]]; then
-    export MAC_ATTENTION_ROOT="$OPENSOURCE_DIR/attention"
-  elif [[ -d "$OPENSOURCE_DIR/MAC-Attention/attention" ]]; then
-    export MAC_ATTENTION_ROOT="$OPENSOURCE_DIR/MAC-Attention/attention"
+  if [[ -d "$MAC_ATTENTION_REPO_ROOT/attention" ]]; then
+    export MAC_ATTENTION_ROOT="$MAC_ATTENTION_REPO_ROOT/attention"
   else
-    export MAC_ATTENTION_ROOT="$MINORTEST_DIR/opensource_1/MAC-Attention/attention"
+    export MAC_ATTENTION_ROOT="$MAC_ATTENTION_REPO_ROOT"
   fi
 fi
 if [[ ! -d "$MAC_ATTENTION_ROOT/src" ]]; then
@@ -25,22 +19,14 @@ fi
 
 if [[ -z "${SGLANG_ROOT:-}" ]]; then
   for candidate in \
-    "$OPENSOURCE_DIR/sglang_official_clean_bbe9c7eeb" \
-    "$OPENSOURCE_DIR/sglang" \
-    "$MINORTEST_DIR/opensource_1/sglang_official_clean_bbe9c7eeb" \
-    "$MINORTEST_DIR/opensource_1/sglang"; do
+    "$MAC_ATTENTION_REPO_ROOT/../sglang" \
+    "$MAC_ATTENTION_REPO_ROOT/../sglang_official_clean_bbe9c7eeb" \
+    "$MAC_ATTENTION_REPO_ROOT/sglang"; do
     if [[ -d "$candidate/python/sglang" ]]; then
       export SGLANG_ROOT="$candidate"
       break
     fi
   done
-fi
-if [[ -z "${LONG_BENCH_ROOT:-}" ]]; then
-  if [[ -d "$MINORTEST_DIR/LongBench" ]]; then
-    export LONG_BENCH_ROOT="$MINORTEST_DIR/LongBench"
-  else
-    export LONG_BENCH_ROOT="$OPENSOURCE_DIR/LongBench"
-  fi
 fi
 export MAC_WORKSPACE_BASE="${MAC_WORKSPACE_BASE:-$MAC_ATTENTION_ROOT}"
 export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$MAC_ATTENTION_ROOT/.torch_extensions}"

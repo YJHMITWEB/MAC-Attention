@@ -1,8 +1,0 @@
-/home/users/jyao/miniconda3/envs/macAttention_latest/lib/python3.12/site-packages/torch/cuda/__init__.py:180: UserWarning: CUDA initialization: CUDA unknown error - this may be due to an incorrectly set up environment, e.g. changing env variable CUDA_VISIBLE_DEVICES after program start. Setting the available devices to be zero. (Triggered internally at /pytorch/c10/cuda/CUDAFunctions.cpp:119.)
-  return torch._C._cuda_getDeviceCount() > 0
-[prompt] target=65536 index=125 raw_tokens=65582 used=65536 id=66f950acbb02136c067c5021
-[prompt] target=73728 index=55 raw_tokens=73993 used=73728 id=66f4cd2c821e116aacb316ef
-[prompt] target=98304 index=469 raw_tokens=98608 used=98304 id=66ec31eb821e116aacb1bf28
-[prompt] target=126976 index=413 raw_tokens=129587 used=126976 id=66fa415cbb02136c067c671c
-[server] mac max_running=1 port=24701
-/home/users/jyao/miniconda3/envs/macAttention_latest/bin/python -m mac_attention.integrations.sglang.launch_server --model-path /storage/users/jyao/ai_general_research/minorTest/models/Llama-3.1-8B-Instruct --attention-backend flashinfer --trust-remote-code --mem-fraction-static 0.7 --tp 1 --port 24701 --api-key token-abc123 --skip-server-warmup --disable-chunked-prefix-cache --disable-radix-cache --page-size 1 --max-running-requests 1 --chunked-prefill-size 8192 --decode-log-interval 16 --cuda-graph-bs 1 --piecewise-cuda-graph-tokens 8192 --disable-piecewise-cuda-graph

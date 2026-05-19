@@ -25,5 +25,3 @@ results/*
 !results/README.md
 !results/portable_mac_cudagraph_handoff_20260519/
 !results/portable_mac_cudagraph_handoff_20260519/**
-!results/portable_plugin_hook_gap_20260517/
-!results/portable_plugin_hook_gap_20260517/**
