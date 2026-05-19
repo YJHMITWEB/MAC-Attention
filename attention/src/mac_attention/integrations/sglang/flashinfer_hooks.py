@@ -3,10 +3,17 @@ from __future__ import annotations
 import inspect
 import math
 import os
+import sys
 from typing import Any, Optional
 
 import torch
 
+from .bridge import (
+    load_mac_decode_rope_preserve_extension,
+    load_mac_merge_downdate_cache_extension,
+    load_mac_persistent_decode_extension,
+    load_mac_prefill_update_cache_extension,
+)
 from .config import get_mac_config
 from .prefill_suffix import (
     build_prefill_suffix_plan,
@@ -17,10 +24,26 @@ from .profiling import enabled as profiling_enabled
 from .profiling import profile_block
 
 
+def _graph_trace(message: str, layer: Any = None) -> None:
+    if os.environ.get("MAC_DEBUG_GRAPH_TRACE", "0").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return
+    layer_id = getattr(layer, "layer_id", None)
+    prefix = "[mac-graph-trace][flashinfer]"
+    if layer_id is not None:
+        prefix += f"[layer={layer_id}]"
+    print(f"{prefix} {message}", file=sys.stderr, flush=True)
+
+
 def flashinfer_backend_init_after(
     result: Any, self: Any, model_runner: Any, *args: Any, **kwargs: Any
 ) -> Any:
-    config = get_mac_config(getattr(model_runner, "server_args", None))
+    server_args = getattr(model_runner, "server_args", None)
+    config = get_mac_config(server_args)
     if not config.enable_mac:
         return result
 
@@ -37,35 +60,48 @@ def flashinfer_backend_init_after(
         or 0
     )
 
+    cuda_graph_enabled = not bool(getattr(server_args, "disable_cuda_graph", True))
+    self.mac_cuda_graph_enabled = cuda_graph_enabled
+    self.mac_sync_prefill_cache_update_when_cuda_graph = (
+        cuda_graph_enabled
+        and os.environ.get("MAC_SYNC_PREFILL_CACHE_UPDATE_WHEN_CUDA_GRAPH", "1")
+        .strip()
+        .lower()
+        not in {"0", "false", "no", "off"}
+    )
+    default_async_slots = (
+        1
+        if cuda_graph_enabled
+        else int(getattr(model_runner.model_config, "num_hidden_layers", 1))
+    )
     async_slot_count = max(
         1,
         int(
             os.environ.get(
                 "MAC_ASYNC_CACHE_UPDATE_SLOTS",
-                str(getattr(model_runner.model_config, "num_hidden_layers", 1)),
+                str(default_async_slots),
             )
         ),
     )
     self.mac_async_cache_update_slots = []
     self.mac_async_cache_update_next_slot = 0
+    self.mac_async_cache_update_deferred_count = 0
 
     if not getattr(self, "skip_prefill", False):
-        from flashinfer import BatchPrefillWithPagedKVCacheWrapper
-
-        for _ in range(async_slot_count):
-            workspace_buffer = torch.empty_like(self.workspace_buffer)
-            self.mac_async_cache_update_slots.append(
-                {
-                    "workspace": workspace_buffer,
-                    "event": torch.cuda.Event(),
-                    "busy": False,
-                    "prefill_wrapper": BatchPrefillWithPagedKVCacheWrapper(
-                        workspace_buffer,
-                        "NHD",
-                        backend=getattr(self, "prefill_backend", "fa2"),
-                    ),
-                }
-            )
+        defer_async_slots = cuda_graph_enabled and os.environ.get(
+            "MAC_DEFER_ASYNC_CACHE_UPDATE_SLOTS", "1"
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        if defer_async_slots:
+            self.mac_async_cache_update_deferred_count = async_slot_count
+        else:
+            for _ in range(async_slot_count):
+                self.mac_async_cache_update_slots.append(
+                    _make_async_cache_update_slot(self)
+                )
+    if cuda_graph_enabled and os.environ.get(
+        "MAC_PRELOAD_EXTENSIONS_FOR_CUDA_GRAPH", "1"
+    ).strip().lower() not in {"0", "false", "no", "off"}:
+        _preload_mac_extensions_for_cuda_graph(config)
     _mac_prefill_trace(
         "backend_init "
         f"enable_mac={config.enable_mac} "
@@ -74,6 +110,65 @@ def flashinfer_backend_init_after(
         f"async_slots={len(getattr(self, 'mac_async_cache_update_slots', []) or [])}"
     )
     return result
+
+
+def _preload_mac_extensions_for_cuda_graph(config: Any) -> None:
+    verbose = os.environ.get("MAC_EXTENSION_VERBOSE", "0") == "1"
+    _graph_trace("preload extensions enter")
+    load_mac_prefill_update_cache_extension(verbose=verbose)
+    _graph_trace("preload prefill_update_cache extension done")
+    load_mac_merge_downdate_cache_extension(verbose=verbose)
+    _graph_trace("preload merge_downdate_cache extension done")
+    load_mac_persistent_decode_extension(
+        verbose=verbose,
+        fast_math=bool(config.mac_persistent_fast_math),
+    )
+    _graph_trace("preload persistent_decode extension done")
+    load_mac_decode_rope_preserve_extension(verbose=verbose)
+    _graph_trace("preload decode_rope_preserve extension done")
+
+
+def _skip_flashinfer_replay_metadata_enabled() -> bool:
+    return os.environ.get(
+        "MAC_CUDAGRAPH_SKIP_FLASHINFER_REPLAY_METADATA", "1"
+    ).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _decode_graph_state_for_backend(backend: Any) -> dict[int, dict[str, bool]]:
+    states = getattr(backend, "mac_cudagraph_decode_states", None)
+    if not isinstance(states, dict):
+        states = {}
+        backend.mac_cudagraph_decode_states = states
+    return states
+
+
+def _record_decode_graph_capture(
+    backend: Any,
+    forward_batch: Any,
+    *,
+    persistent: bool,
+) -> None:
+    if not _is_cuda_graph_capturing():
+        return
+    try:
+        bs = int(getattr(forward_batch, "batch_size", 0))
+    except Exception:
+        return
+    if bs <= 0:
+        return
+    state = _decode_graph_state_for_backend(backend).setdefault(
+        bs,
+        {"persistent_seen": False, "fallback_seen": False},
+    )
+    if persistent:
+        state["persistent_seen"] = True
+    else:
+        state["fallback_seen"] = True
 
 
 def flashinfer_init_forward_metadata_around(original_fn: Any, self: Any, forward_batch: Any) -> Any:
@@ -87,6 +182,21 @@ def flashinfer_init_forward_metadata_around(original_fn: Any, self: Any, forward
     config = getattr(self, "mac_config", None)
     if config is None:
         config = get_mac_config()
+    if config.enable_mac:
+        # SGLang's piecewise CUDA graph replay creates a static ForwardBatch
+        # and does not preserve plugin-only Python attributes. Keep the
+        # scheduler's suffix-update gate on the backend so the FlashInfer hook
+        # can make the same cache-update decision during PCG replay without
+        # requiring a local SGLang patch.
+        self.mac_prefill_cache_update_starts_current = getattr(
+            forward_batch, "mac_prefill_cache_update_starts", None
+        )
+        self.mac_extend_prefix_lens_cpu_current = getattr(
+            forward_batch, "extend_prefix_lens_cpu", None
+        )
+        self.mac_extend_seq_lens_cpu_current = getattr(
+            forward_batch, "extend_seq_lens_cpu", None
+        )
     if not config.enable_mac or not config.mac_force_paged_prefill:
         _mac_prefill_trace(
             "init_metadata skip config "
@@ -118,9 +228,20 @@ def flashinfer_init_forward_metadata_around(original_fn: Any, self: Any, forward
         _mac_prefill_trace("init_metadata skip multi_item")
         return result
     is_mixed = getattr(forward_batch.forward_mode, "is_mixed", lambda: False)()
-    if not is_mixed and not _prefill_cache_update_required_for_batch(
-        forward_batch, int(getattr(forward_batch, "batch_size", 0))
-    ):
+    batch_size = int(getattr(forward_batch, "batch_size", 0))
+    suffix_plan_for_graph = None
+    try:
+        extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        q_len_for_plan = sum(max(0, int(x)) for x in extend_lens[:batch_size])
+        suffix_plan_for_graph = build_prefill_suffix_plan(
+            forward_batch, batch_size, q_len_for_plan
+        )
+        cache_update_required = (
+            suffix_plan_for_graph is None or suffix_plan_for_graph.total_len > 0
+        )
+    except Exception:
+        cache_update_required = True
+    if not is_mixed and not cache_update_required:
         _mac_prefill_trace(
             "init_metadata skip no_cache_update "
             f"batch={getattr(forward_batch, 'batch_size', None)} "
@@ -180,6 +301,65 @@ def flashinfer_init_forward_metadata_around(original_fn: Any, self: Any, forward
         f"prefix_lens={getattr(forward_batch, 'extend_prefix_lens_cpu', None)}"
     )
     return result
+
+
+def flashinfer_init_forward_metadata_capture_cuda_graph_around(
+    original_fn: Any, self: Any, *args: Any, **kwargs: Any
+) -> Any:
+    bs = args[0] if len(args) > 0 else kwargs.get("bs")
+    forward_mode = args[5] if len(args) > 5 else kwargs.get("forward_mode")
+    if _skip_flashinfer_replay_metadata_enabled():
+        config = getattr(self, "mac_config", None)
+        if config is None:
+            config = get_mac_config()
+        try:
+            is_decode_graph = bool(forward_mode.is_decode_or_idle())
+        except Exception:
+            is_decode_graph = False
+        if config.enable_mac and is_decode_graph and bs is not None:
+            _decode_graph_state_for_backend(self)[int(bs)] = {
+                "persistent_seen": False,
+                "fallback_seen": False,
+            }
+    if os.environ.get("MAC_DEBUG_GRAPH_TRACE", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        num_tokens = args[1] if len(args) > 1 else kwargs.get("num_tokens")
+        _graph_trace(
+            "capture_metadata enter "
+            f"bs={bs} num_tokens={num_tokens} mode={forward_mode}"
+        )
+    result = original_fn(self, *args, **kwargs)
+    _graph_trace("capture_metadata exit")
+    return result
+
+
+def flashinfer_init_forward_metadata_replay_cuda_graph_around(
+    original_fn: Any, self: Any, *args: Any, **kwargs: Any
+) -> Any:
+    bs = args[0] if len(args) > 0 else kwargs.get("bs")
+    forward_mode = args[5] if len(args) > 5 else kwargs.get("forward_mode")
+    if _skip_flashinfer_replay_metadata_enabled() and bs is not None:
+        config = getattr(self, "mac_config", None)
+        if config is None:
+            config = get_mac_config()
+        try:
+            is_decode_graph = bool(forward_mode.is_decode_or_idle())
+        except Exception:
+            is_decode_graph = False
+        state = getattr(self, "mac_cudagraph_decode_states", {}).get(int(bs), {})
+        if (
+            config.enable_mac
+            and is_decode_graph
+            and bool(state.get("persistent_seen", False))
+            and not bool(state.get("fallback_seen", False))
+        ):
+            _graph_trace(f"replay_metadata skip flashinfer bs={bs}")
+            return None
+    return original_fn(self, *args, **kwargs)
 
 
 def _make_flashinfer_init_forward_metadata_direct(original_fn: Any) -> Any:
@@ -271,6 +451,44 @@ def _mac_float_env(name: str, default: float) -> float:
         return default
 
 
+def _is_torch_compiling() -> bool:
+    compiler = getattr(torch, "compiler", None)
+    if compiler is not None and hasattr(compiler, "is_compiling"):
+        try:
+            return bool(compiler.is_compiling())
+        except Exception:
+            return False
+    dynamo = getattr(torch, "_dynamo", None)
+    if dynamo is not None and hasattr(dynamo, "is_compiling"):
+        try:
+            return bool(dynamo.is_compiling())
+        except Exception:
+            return False
+    return False
+
+
+def _is_cuda_graph_capturing() -> bool:
+    if _is_torch_compiling():
+        return False
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
+def _is_piecewise_cuda_graph_active() -> bool:
+    try:
+        from sglang.srt.compilation.piecewise_context_manager import (
+            is_in_piecewise_cuda_graph,
+        )
+
+        return bool(is_in_piecewise_cuda_graph())
+    except Exception:
+        return False
+
+
 def _mac_int_env(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None:
@@ -335,6 +553,8 @@ def _log_persistent_debug_summary(
     layer: Any,
     config: Any,
 ) -> None:
+    if _is_torch_compiling() or _is_cuda_graph_capturing() or _is_piecewise_cuda_graph_active():
+        return
     interval = _persistent_debug_log_interval()
     if interval <= 0:
         return
@@ -738,6 +958,8 @@ def _maybe_eject_low_hit_persistent_cache(
     req_ids: torch.Tensor,
     past_lens: torch.Tensor,
 ) -> None:
+    if _is_cuda_graph_capturing():
+        return
     threshold = _mac_float_env("MAC_ADAPTIVE_LOW_HIT_EJECT_THRESHOLD", -1.0)
     if threshold < 0.0:
         return
@@ -883,6 +1105,11 @@ def _ensure_persistent_workspace(backend: Any, metadata: Any, config: Any, batch
 
 
 def _req_ids_to_host_list(metadata: Any, req_ids: torch.Tensor) -> list[int]:
+    if _is_torch_compiling() or _is_cuda_graph_capturing() or _is_piecewise_cuda_graph_active():
+        req_ids_host = getattr(metadata, "req_ids_host", None)
+        if req_ids_host is None:
+            return []
+        return [int(x) for x in req_ids_host[: int(req_ids.numel())]]
     try:
         return [int(x) for x in req_ids.detach().cpu().tolist()]
     except Exception:
@@ -915,6 +1142,8 @@ def _set_low_hit_ejected(metadata: Any, req_ids: torch.Tensor, value: bool) -> N
 
 
 def _has_low_hit_ejected(metadata: Any, req_ids: torch.Tensor) -> bool:
+    if _is_cuda_graph_capturing() or _is_piecewise_cuda_graph_active():
+        return False
     ejected = getattr(metadata, "mac_low_hit_ejected_host", None)
     if ejected is None:
         return False
@@ -938,6 +1167,24 @@ def _mark_persistent_ready(metadata: Any, req_ids: torch.Tensor) -> None:
         or getattr(metadata, "request_epoch", None) is None
     ):
         return
+    if _is_cuda_graph_capturing() or _is_piecewise_cuda_graph_active() or _is_torch_compiling():
+        mark_ready = getattr(getattr(metadata, "cache_ext", None), "mac_mark_persistent_ready", None)
+        if mark_ready is not None:
+            mark_ready(
+                metadata.mac_cache_ready,
+                metadata.mac_cache_epoch,
+                metadata.request_epoch,
+                req_ids,
+            )
+            return
+    reqs_host = _req_ids_to_host_list(metadata, req_ids)
+    if reqs_host:
+        for req in reqs_host:
+            if req < 0 or req >= metadata.mac_cache_ready.shape[0]:
+                continue
+            metadata.mac_cache_epoch[req].copy_(metadata.request_epoch[req])
+            metadata.mac_cache_ready[req].fill_(True)
+        return
     req_long = req_ids.long()
     metadata.mac_cache_epoch[req_long] = metadata.request_epoch[req_long]
     metadata.mac_cache_ready[req_long] = True
@@ -953,12 +1200,39 @@ def _invalidate_persistent_ready(metadata: Any, req_ids: torch.Tensor) -> None:
     epoch = getattr(metadata, "mac_cache_epoch", None)
     if ready is None or epoch is None:
         return
+    if (
+        getattr(metadata, "request_epoch", None) is not None
+        and (_is_cuda_graph_capturing() or _is_piecewise_cuda_graph_active() or _is_torch_compiling())
+    ):
+        invalidate_ready = getattr(
+            getattr(metadata, "cache_ext", None),
+            "mac_invalidate_persistent_ready",
+            None,
+        )
+        if invalidate_ready is not None:
+            invalidate_ready(
+                ready,
+                epoch,
+                metadata.request_epoch,
+                req_ids,
+            )
+            return
+    reqs_host = _req_ids_to_host_list(metadata, req_ids)
+    if reqs_host:
+        for req in reqs_host:
+            if req < 0 or req >= ready.shape[0]:
+                continue
+            ready[req].fill_(False)
+            epoch[req].fill_(-1)
+        return
     req_long = req_ids.long()
     ready[req_long] = False
     epoch[req_long] = -1
 
 
 def _persistent_ready(metadata: Any, req_ids: torch.Tensor) -> bool:
+    if _is_cuda_graph_capturing():
+        return True
     if _has_low_hit_ejected(metadata, req_ids):
         return False
     ready_host = getattr(metadata, "mac_cache_ready_host", None)
@@ -1136,7 +1410,39 @@ def _try_persistent_decode(
 
 
 
+def _make_async_cache_update_slot(backend: Any) -> dict[str, Any]:
+    from flashinfer import BatchPrefillWithPagedKVCacheWrapper
+
+    workspace_buffer = torch.empty_like(backend.workspace_buffer)
+    return {
+        "workspace": workspace_buffer,
+        "event": torch.cuda.Event(),
+        "busy": False,
+        "prefill_wrapper": BatchPrefillWithPagedKVCacheWrapper(
+            workspace_buffer,
+            "NHD",
+            backend=getattr(backend, "prefill_backend", "fa2"),
+        ),
+    }
+
+
+def _ensure_async_cache_update_slots(backend: Any) -> None:
+    deferred_count = int(getattr(backend, "mac_async_cache_update_deferred_count", 0) or 0)
+    if deferred_count <= 0:
+        return
+    if _is_torch_compiling() or _is_cuda_graph_capturing() or _is_piecewise_cuda_graph_active():
+        return
+    slots = getattr(backend, "mac_async_cache_update_slots", None)
+    if slots is None:
+        slots = []
+        backend.mac_async_cache_update_slots = slots
+    for _ in range(deferred_count):
+        slots.append(_make_async_cache_update_slot(backend))
+    backend.mac_async_cache_update_deferred_count = 0
+
+
 def _acquire_async_cache_update_slot(backend: Any) -> Optional[dict[str, Any]]:
+    _ensure_async_cache_update_slots(backend)
     slots = getattr(backend, "mac_async_cache_update_slots", None)
     if not slots:
         return None
@@ -1186,6 +1492,56 @@ def _get_prefill_cache_lengths(mac_metadata: Any, forward_batch: Any):
     return request_length, lens
 
 
+def _get_graph_safe_prefill_cache_lengths(mac_metadata: Any, forward_batch: Any):
+    """Return stable cache-update tensors for CUDA graph capture/replay.
+
+    CUDA graph nodes retain raw tensor data pointers. The eager path can use
+    short-lived clones because kernels launch immediately, but captured custom
+    kernels must never reference clone storage that Python may free after
+    capture. These buffers live on MACMetadata for the lifetime of the layer.
+    """
+
+    batch_size = int(mac_metadata.req_ids.numel())
+    req_ids_buf = getattr(mac_metadata, "prefill_update_req_ids_buf", None)
+    offsets_buf = getattr(mac_metadata, "prefill_update_offsets_buf", None)
+    lens_buf = getattr(mac_metadata, "prefill_update_lens_buf", None)
+    prefix_lens_buf = getattr(mac_metadata, "prefill_update_prefix_lens_buf", None)
+    if (
+        req_ids_buf is None
+        or offsets_buf is None
+        or lens_buf is None
+        or prefix_lens_buf is None
+        or req_ids_buf.shape[0] < batch_size
+        or offsets_buf.shape[0] < batch_size + 1
+        or lens_buf.shape[0] < batch_size
+        or prefix_lens_buf.shape[0] < batch_size
+    ):
+        raise RuntimeError(
+            "MAC graph-safe prefill cache buffers are not initialized or too small: "
+            f"batch={batch_size}"
+        )
+
+    req_ids = req_ids_buf[:batch_size]
+    offsets = offsets_buf[: batch_size + 1]
+    lens = lens_buf[:batch_size]
+    prefix_lens = prefix_lens_buf[:batch_size]
+
+    req_ids.copy_(mac_metadata.req_ids)
+    offsets.copy_(mac_metadata.offsets[: batch_size + 1])
+    torch.sub(offsets[1 : batch_size + 1], offsets[:batch_size], out=lens)
+
+    # SGLang's piecewise CUDA graph replay feeds seq_lens as a graph input, but
+    # extend_prefix_lens is not part of the compiled subgraph input list. Reading
+    # it here can capture a warmup/dummy pointer and replay stale prefix lengths.
+    # Derive the prefix from graph inputs instead.
+    seq_lens_i32 = forward_batch.seq_lens[:batch_size].to(
+        device=mac_metadata.device, dtype=torch.int32, non_blocking=True
+    )
+    torch.sub(seq_lens_i32, lens, out=prefix_lens)
+    prefix_lens.clamp_(min=0)
+    return prefix_lens, lens, offsets, req_ids
+
+
 def _offload_fast_cache(
     mac_metadata: Any,
     forward_batch: Any,
@@ -1223,6 +1579,16 @@ def _offload_fast_cache(
         request_length[req_ids.long()] = prefix_lens
     if offsets is None:
         offsets = mac_metadata.offsets
+    if query.shape != output.shape:
+        raise RuntimeError(
+            "MAC prefill cache update shape mismatch: "
+            f"src_q={tuple(query.shape)} src_attn={tuple(output.shape)} "
+            f"src_lse={tuple(softmax_lse.shape)} "
+            f"batch={batch_size} "
+            f"mode={getattr(forward_batch, 'forward_mode', None)} "
+            f"num_token_non_padded={getattr(forward_batch, 'num_token_non_padded_cpu', None)} "
+            f"starts={getattr(forward_batch, 'mac_prefill_cache_update_starts', None)}"
+        )
     mac_metadata.cache_ext.mac_prefill_update_cache(
         mac_metadata.unified_query_cache,
         mac_metadata.unified_attn_cache,
@@ -1271,6 +1637,7 @@ def _launch_prefill_cache_update_async(
             layer,
         )
         return
+    graph_safe = _is_cuda_graph_capturing() or _is_piecewise_cuda_graph_active() or _is_torch_compiling()
     suffix_plan = build_prefill_suffix_plan(forward_batch, batch_size, q_input.shape[0])
     if suffix_plan is not None and suffix_plan.total_len <= 0:
         _mac_prefill_trace(
@@ -1281,22 +1648,58 @@ def _launch_prefill_cache_update_async(
         )
         return
 
-    request_length, lens = _get_prefill_cache_lengths(mac_metadata, forward_batch)
-    req_ids = mac_metadata.req_ids.clone()
-    offsets = mac_metadata.offsets[: batch_size + 1].clone()
-    qo_indptr = backend.qo_indptr[0][: batch_size + 1].clone()
-    kv_indptr = backend.kv_indptr[0][: batch_size + 1].clone()
-    kv_indices = _build_prefill_kv_indices(backend, forward_batch, batch_size)
-    kv_last_page_len = backend.kv_last_page_len[:batch_size].clone()
+    if graph_safe:
+        request_length, lens, offsets, req_ids = _get_graph_safe_prefill_cache_lengths(
+            mac_metadata, forward_batch
+        )
+    else:
+        request_length, lens = _get_prefill_cache_lengths(mac_metadata, forward_batch)
+        req_ids = mac_metadata.req_ids.clone()
+        offsets = mac_metadata.offsets[: batch_size + 1].clone()
+    needs_rectification_plan = int(config.mac_semantic_pos_ahead) > 0 and not graph_safe
+    needs_suffix_kv_compaction = suffix_plan is not None
+    if needs_rectification_plan or needs_suffix_kv_compaction:
+        qo_indptr = backend.qo_indptr[0][: batch_size + 1].clone()
+        kv_indptr = backend.kv_indptr[0][: batch_size + 1].clone()
+        kv_indices = _build_prefill_kv_indices(backend, forward_batch, batch_size)
+        kv_last_page_len = backend.kv_last_page_len[:batch_size].clone()
+    else:
+        qo_indptr = None
+        kv_indptr = None
+        kv_indices = None
+        kv_last_page_len = None
     o_source = o
     lse_source = lse
 
+    if (
+        graph_safe
+        and suffix_plan is None
+        and batch_size == 1
+        and q_to_cache.shape[0] < q_input.shape[0]
+    ):
+        tail_len = int(q_to_cache.shape[0])
+        q_input = q_input[-tail_len:].contiguous()
+        o_source = o[-tail_len:].contiguous()
+        lse_source = lse[-tail_len:].contiguous()
+        lens.fill_(tail_len)
+        offsets[:1].zero_()
+        offsets[1:2].fill_(tail_len)
+        seq_lens_i32 = forward_batch.seq_lens[:1].to(
+            device=mac_metadata.device, dtype=torch.int32, non_blocking=True
+        )
+        torch.sub(seq_lens_i32, lens[:1], out=request_length[:1])
+        request_length[:1].clamp_(min=0)
+
     if suffix_plan is not None:
+        assert kv_indices is not None
+        assert kv_last_page_len is not None
         q_input = compact_by_segments(q_input, suffix_plan.segments)
         if bool(getattr(mac_metadata, "cur_q_before_rope_compacted", False)):
-            if q_to_cache.shape[0] != suffix_plan.total_len:
+            if q_to_cache.shape[0] < suffix_plan.total_len:
                 _invalidate_persistent_ready(mac_metadata, req_ids)
                 return
+            if q_to_cache.shape[0] > suffix_plan.total_len:
+                q_to_cache = q_to_cache[-int(suffix_plan.total_len) :]
             q_to_cache = q_to_cache.contiguous()
         else:
             q_to_cache = compact_by_segments(q_to_cache, suffix_plan.segments)
@@ -1329,9 +1732,26 @@ def _launch_prefill_cache_update_async(
             kv_indices, suffix_plan.segments, batch_size=batch_size
         )
         kv_last_page_len = kv_last_page_len.index_select(0, req_index).contiguous()
+    elif q_to_cache.shape[0] != q_input.shape[0]:
+        # Piecewise CUDA graph pads the transformer layer to a static capture
+        # length, then SGLang's unified_attention_with_output narrows q/k/v to
+        # num_token_non_padded_cpu before calling the attention backend. MAC
+        # preserves q before that backend-local narrowing, so trim the cached q
+        # view to the exact rows that produced o/lse. This keeps the MAC cache
+        # update in the graph while avoiding padded rows that FlashInfer never
+        # computed attention for.
+        if q_to_cache.shape[0] < q_input.shape[0]:
+            raise RuntimeError(
+                "MAC preserved fewer q rows than the attention backend received: "
+                f"q_to_cache={tuple(q_to_cache.shape)} q_input={tuple(q_input.shape)} "
+                f"batch={batch_size} "
+                f"mode={getattr(forward_batch, 'forward_mode', None)} "
+                f"num_token_non_padded={getattr(forward_batch, 'num_token_non_padded_cpu', None)}"
+            )
+        q_to_cache = q_to_cache[: q_input.shape[0]].contiguous()
 
     slot = _acquire_async_cache_update_slot(backend)
-    if int(config.mac_semantic_pos_ahead) > 0 and slot is None:
+    if int(config.mac_semantic_pos_ahead) > 0 and slot is None and not graph_safe:
         _mac_prefill_trace(
             "prefill_cache_update skip no_async_slot "
             f"semantic_ahead={config.mac_semantic_pos_ahead}",
@@ -1340,31 +1760,63 @@ def _launch_prefill_cache_update_async(
         _invalidate_persistent_ready(mac_metadata, req_ids)
         return
     stream = mac_metadata.stream
+    sync_prefill_for_cuda_graph = bool(
+        getattr(backend, "mac_sync_prefill_cache_update_when_cuda_graph", False)
+    )
+    if graph_safe or sync_prefill_for_cuda_graph:
+        # CUDA graph capture needs the cache-update kernels and ready-state
+        # writes to be captured on the active graph stream. The normal async
+        # side stream is valuable in eager serving, but during piecewise CUDA
+        # graph compile/capture/replay it can leave MAC's prefill cache write
+        # outside the stream ordering that SGLang records for the graph. We use
+        # the same active-stream path for regular prefill when decode CUDA graph
+        # is enabled, because SGLang can immediately enter replay after the last
+        # prefill chunk and must observe a fully ordered MAC cache/ready state.
+        stream = None
+    graph_prefill_wrapper = None
+    if graph_safe and int(config.mac_semantic_pos_ahead) > 0:
+        if bool(getattr(backend, "mac_graph_rectification_ready", False)):
+            graph_prefill_wrapper = getattr(backend, "mac_graph_rectification_wrapper", None)
     if stream is None:
         cache_o, cache_lse = o_source, lse_source
         rect_window = int(config.mac_semantic_pos_ahead)
         if rect_window > 0:
             rect_window -= 1
-        if int(config.mac_semantic_pos_ahead) > 0 and slot is not None:
-            wrapper = slot["prefill_wrapper"]
-            with profile_block(
-                "mac.prefill.rectification_begin_forward",
-                layer=layer_id,
-                forward_batch=forward_batch,
-                cuda=True,
-            ):
-                wrapper.begin_forward(
-                    qo_indptr,
-                    kv_indptr,
-                    kv_indices,
-                    kv_last_page_len,
-                    q_input.shape[1],
-                    k_buffer.shape[1],
-                    mac_metadata.head_dim,
-                    1,
-                    q_data_type=mac_metadata.dtype,
-                    window_left=rect_window,
+        if int(config.mac_semantic_pos_ahead) > 0:
+            if graph_safe:
+                wrapper = graph_prefill_wrapper
+            else:
+                wrapper = slot["prefill_wrapper"] if slot is not None else None
+            if wrapper is None:
+                _mac_prefill_trace(
+                    "prefill_cache_update skip no_rectification_wrapper "
+                    f"semantic_ahead={config.mac_semantic_pos_ahead} "
+                    f"graph_safe={graph_safe}",
+                    layer,
                 )
+                _invalidate_persistent_ready(mac_metadata, req_ids)
+                if slot is not None:
+                    slot["busy"] = False
+                return
+            if not graph_safe:
+                with profile_block(
+                    "mac.prefill.rectification_begin_forward",
+                    layer=layer_id,
+                    forward_batch=forward_batch,
+                    cuda=True,
+                ):
+                    wrapper.begin_forward(
+                        qo_indptr,
+                        kv_indptr,
+                        kv_indices,
+                        kv_last_page_len,
+                        q_input.shape[1],
+                        k_buffer.shape[1],
+                        mac_metadata.head_dim,
+                        1,
+                        q_data_type=mac_metadata.dtype,
+                        window_left=rect_window,
+                    )
             with profile_block(
                 "mac.prefill.rectification_forward_lse",
                 layer=layer_id,
@@ -1410,13 +1862,14 @@ def _launch_prefill_cache_update_async(
                 req_ids=req_ids,
             )
             _mark_persistent_ready(mac_metadata, req_ids)
-            _mac_prefill_trace(
-                "prefill_cache_update marked_ready_sync "
-                f"batch={batch_size} "
-                f"q_cached={tuple(q_to_cache.shape)} "
-                f"lens={lens.detach().cpu().tolist() if torch.is_tensor(lens) else lens}",
-                layer,
-            )
+            if _mac_prefill_trace_enabled(layer):
+                _mac_prefill_trace(
+                    "prefill_cache_update marked_ready_sync "
+                    f"batch={batch_size} "
+                    f"q_cached={tuple(q_to_cache.shape)} "
+                    f"lens={lens.detach().cpu().tolist() if torch.is_tensor(lens) else lens}",
+                    layer,
+                )
             if slot is not None:
                 slot["busy"] = False
         return
@@ -1542,7 +1995,19 @@ def flashinfer_forward_decode_around(
     **kwargs: Any,
 ) -> Any:
     layer_id = getattr(layer, "layer_id", None)
+    graph_capture = _is_cuda_graph_capturing()
+    if graph_capture:
+        _graph_trace(
+            "decode enter "
+            f"q={tuple(q.shape) if torch.is_tensor(q) else None} "
+            f"k={tuple(k.shape) if torch.is_tensor(k) else None} "
+            f"save_kv_cache={save_kv_cache}",
+            layer,
+        )
     if not _supports_mac_backend(self, layer, forward_batch):
+        if graph_capture:
+            _record_decode_graph_capture(self, forward_batch, persistent=False)
+            _graph_trace("decode unsupported -> original", layer)
         if not profiling_enabled():
             return original_fn(
                 self, q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs
@@ -1574,6 +2039,9 @@ def flashinfer_forward_decode_around(
         "yes",
         "on",
     }:
+        if graph_capture:
+            _record_decode_graph_capture(self, forward_batch, persistent=False)
+            _graph_trace("decode bypass -> original", layer)
         return original_fn(
             self, q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs
         )
@@ -1581,13 +2049,21 @@ def flashinfer_forward_decode_around(
         if k is not None:
             assert v is not None
             if save_kv_cache:
+                if graph_capture:
+                    _graph_trace("decode before set_kv_buffer", layer)
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
+                if graph_capture:
+                    _graph_trace("decode after set_kv_buffer", layer)
 
         q_input = q.view(-1, layer.tp_q_head_num, layer.head_dim)
         k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        if graph_capture:
+            _graph_trace("decode before wait_cache_update", layer)
         mac_metadata.wait_for_cache_update()
+        if graph_capture:
+            _graph_trace("decode before persistent", layer)
         persistent_out = _try_persistent_decode(
             self,
             forward_batch,
@@ -1599,9 +2075,16 @@ def flashinfer_forward_decode_around(
             cache_loc,
             layer,
         )
+        if graph_capture:
+            _graph_trace(f"decode after persistent hit={persistent_out is not None}", layer)
         if persistent_out is not None:
+            _record_decode_graph_capture(self, forward_batch, persistent=True)
             return persistent_out.view(-1, layer.tp_q_head_num * layer.head_dim)
+        if graph_capture:
+            _record_decode_graph_capture(self, forward_batch, persistent=False)
         _invalidate_persistent_ready(mac_metadata, mac_metadata.req_ids[: int(forward_batch.batch_size)])
+        if graph_capture:
+            _graph_trace("decode fallback -> original", layer)
         return original_fn(
             self, q, k, v, layer, forward_batch, save_kv_cache=False, **kwargs
         )
@@ -1652,7 +2135,10 @@ def flashinfer_forward_decode_around(
             layer,
     )
     if persistent_out is not None:
+        _record_decode_graph_capture(self, forward_batch, persistent=True)
         return persistent_out.view(-1, layer.tp_q_head_num * layer.head_dim)
+    if graph_capture:
+        _record_decode_graph_capture(self, forward_batch, persistent=False)
     _invalidate_persistent_ready(mac_metadata, mac_metadata.req_ids[: int(forward_batch.batch_size)])
     with profile_block(
         "flashinfer.forward_decode.original.persistent_fallback",

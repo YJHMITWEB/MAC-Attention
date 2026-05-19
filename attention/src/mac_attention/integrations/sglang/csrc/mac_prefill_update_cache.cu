@@ -79,11 +79,13 @@ struct UpdateParams {
   const void* attn_src; // [sumN,H,D] bf16
   const void* lse_src;  // [sumN,H]   f32
   int R, M, H, D;
+  int32_t src_rows;
   const int32_t* req_ids;   // [B]
   int32_t B;
   const int32_t* offsets;   // [B+1] (rows)
   const int32_t* lens;      // [B]
-  int32_t* request_length;  // [R]
+  int32_t* request_length;  // [R] legacy indexed-by-req, or [B] prefix lengths
+  bool request_length_by_batch;
 };
 
 // ------------------------------- helpers ----------------------------------
@@ -150,7 +152,11 @@ static void fill_params(UpdateParams& p,
               "src_q must be [sumN,H,D]");
   TORCH_CHECK(src_attn.sizes() == src_q.sizes(), "src_attn must match src_q");
   TORCH_CHECK(src_lse.dim() == 2 && src_lse.size(1) == num_heads, "src_lse must be [sumN,H]");
+  TORCH_CHECK(src_lse.size(0) == src_q.size(0), "src_lse row count must match src_q");
   TORCH_CHECK(offsets.size(0) == (req_ids.size(0) + 1), "offsets must be [B+1]");
+  TORCH_CHECK(lens.size(0) == req_ids.size(0), "lens must be [B]");
+  TORCH_CHECK(request_length.size(0) == R || request_length.size(0) == req_ids.size(0),
+              "request_length must be [R] or [B]");
 
   p.q_cache = q_cache.data_ptr();
   p.attn_cache = attn_cache.data_ptr();
@@ -162,11 +168,13 @@ static void fill_params(UpdateParams& p,
   p.M = capacity;
   p.H = num_heads;
   p.D = head_dim;
+  p.src_rows = (int32_t)src_q.size(0);
   p.req_ids = req_ids.data_ptr<int32_t>();
   p.B = (int)req_ids.size(0);
   p.offsets = offsets.data_ptr<int32_t>();
   p.lens = lens.data_ptr<int32_t>();
   p.request_length = request_length.data_ptr<int32_t>();
+  p.request_length_by_batch = (request_length.size(0) == req_ids.size(0));
 }
 
 static inline int next_pow2_clamped(int v) {
@@ -186,11 +194,16 @@ __global__ void mac_prefill_update_cache_kernel(UpdateParams p) {
   const int req = p.req_ids[by];
   const int32_t Ni = p.lens[by];
   if (Ni <= 0 || p.M <= 0) return;
+  if (req < 0 || req >= p.R) return;
 
   const int start = (Ni > p.M) ? (Ni - p.M) : 0;
   const int keep = Ni - start;
+  const int32_t base_off = p.offsets[by];
+  if (base_off < 0 || base_off + Ni > p.src_rows) return;
 
-  const int32_t L_before = p.request_length[req];
+  int32_t L_before =
+      p.request_length_by_batch ? p.request_length[by] : p.request_length[req];
+  if (L_before < 0) L_before = 0;
 
   const size_t row_bf16 = (size_t)p.H * (size_t)p.D * sizeof(__nv_bfloat16);
   const size_t row_f32 = (size_t)p.H * sizeof(float);
@@ -203,7 +216,6 @@ __global__ void mac_prefill_update_cache_kernel(UpdateParams p) {
   const uint8_t* __restrict__ a_src = (const uint8_t*)p.attn_src;
   const uint8_t* __restrict__ l_src = (const uint8_t*)p.lse_src;
 
-  const int32_t base_off = p.offsets[by];
   const int base_dest = (int)((L_before + start) % p.M);
 
   for (int bx = blockIdx.x; bx < keep; bx += gridDim.x) {
@@ -224,9 +236,60 @@ __global__ void mac_prefill_update_cache_kernel(UpdateParams p) {
     copy_bytes_16(lse_cache_r + dst_l, l_src + src_l_off, row_f32);
   }
 
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
+  if (!p.request_length_by_batch && blockIdx.x == 0 && threadIdx.x == 0) {
     atomicAdd(&p.request_length[req], Ni);
   }
+}
+
+__global__ void mac_mark_persistent_ready_kernel(bool* __restrict__ ready,
+                                                int64_t* __restrict__ cache_epoch,
+                                                const int64_t* __restrict__ request_epoch,
+                                                const int32_t* __restrict__ req_ids,
+                                                int32_t B,
+                                                int32_t R) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= B) return;
+  int req = req_ids[i];
+  if (req < 0 || req >= R) return;
+  cache_epoch[req] = request_epoch[req];
+  ready[req] = true;
+}
+
+__global__ void mac_invalidate_persistent_ready_kernel(bool* __restrict__ ready,
+                                                       int64_t* __restrict__ cache_epoch,
+                                                       int64_t* __restrict__ request_epoch,
+                                                       const int32_t* __restrict__ req_ids,
+                                                       int32_t B,
+                                                       int32_t R) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= B) return;
+  int req = req_ids[i];
+  if (req < 0 || req >= R) return;
+  ready[req] = false;
+  cache_epoch[req] = -1;
+  request_epoch[req] += 1;
+}
+
+__global__ void mac_update_request_state_kernel(int32_t* __restrict__ req_len,
+                                                int32_t* __restrict__ match_req_len,
+                                                int32_t* __restrict__ cache_lens,
+                                                const int32_t* __restrict__ req_ids,
+                                                const int32_t* __restrict__ seq_lens,
+                                                const int32_t* __restrict__ cur_lens,
+                                                int32_t B,
+                                                int32_t R) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= B) return;
+  int32_t seq_len = seq_lens[i];
+  int32_t cur_len = cur_lens[i];
+  int32_t cache_len = seq_len - cur_len;
+  if (cache_len < 0) cache_len = 0;
+  cache_lens[i] = cache_len;
+
+  int req = req_ids[i];
+  if (req < 0 || req >= R) return;
+  req_len[req] = seq_len;
+  match_req_len[req] = cache_len;
 }
 
 // ------------------------------- launcher ---------------------------------
@@ -279,10 +342,142 @@ void mac_prefill_update_cache(Tensor q_cache,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void mac_mark_persistent_ready(Tensor ready,
+                               Tensor cache_epoch,
+                               Tensor request_epoch,
+                               Tensor req_ids) {
+  if (req_ids.size(0) == 0) return;
+  CHECK_CUDA(ready);
+  CHECK_CONTIG(ready);
+  CHECK_DTYPE(ready, torch::kBool);
+  CHECK_CUDA(cache_epoch);
+  CHECK_CONTIG(cache_epoch);
+  CHECK_DTYPE(cache_epoch, torch::kInt64);
+  CHECK_CUDA(request_epoch);
+  CHECK_CONTIG(request_epoch);
+  CHECK_DTYPE(request_epoch, torch::kInt64);
+  CHECK_CUDA(req_ids);
+  CHECK_CONTIG(req_ids);
+  CHECK_DTYPE(req_ids, torch::kInt32);
+  TORCH_CHECK(cache_epoch.size(0) == ready.size(0), "cache_epoch must match ready");
+  TORCH_CHECK(request_epoch.size(0) == ready.size(0), "request_epoch must match ready");
+
+  c10::cuda::CUDAGuard dev_guard(ready.device());
+  c10::cuda::CUDAStreamGuard stream_guard(at::cuda::getCurrentCUDAStream(ready.get_device()));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream(ready.get_device()).stream();
+  int32_t B = (int32_t)req_ids.size(0);
+  int32_t R = (int32_t)ready.size(0);
+  int threads = 128;
+  int blocks = (B + threads - 1) / threads;
+  mac_mark_persistent_ready_kernel<<<blocks, threads, 0, stream>>>(
+      ready.data_ptr<bool>(),
+      cache_epoch.data_ptr<int64_t>(),
+      request_epoch.data_ptr<int64_t>(),
+      req_ids.data_ptr<int32_t>(),
+      B,
+      R);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void mac_invalidate_persistent_ready(Tensor ready,
+                                     Tensor cache_epoch,
+                                     Tensor request_epoch,
+                                     Tensor req_ids) {
+  if (req_ids.size(0) == 0) return;
+  CHECK_CUDA(ready);
+  CHECK_CONTIG(ready);
+  CHECK_DTYPE(ready, torch::kBool);
+  CHECK_CUDA(cache_epoch);
+  CHECK_CONTIG(cache_epoch);
+  CHECK_DTYPE(cache_epoch, torch::kInt64);
+  CHECK_CUDA(request_epoch);
+  CHECK_CONTIG(request_epoch);
+  CHECK_DTYPE(request_epoch, torch::kInt64);
+  CHECK_CUDA(req_ids);
+  CHECK_CONTIG(req_ids);
+  CHECK_DTYPE(req_ids, torch::kInt32);
+  TORCH_CHECK(cache_epoch.size(0) == ready.size(0), "cache_epoch must match ready");
+  TORCH_CHECK(request_epoch.size(0) == ready.size(0), "request_epoch must match ready");
+
+  c10::cuda::CUDAGuard dev_guard(ready.device());
+  c10::cuda::CUDAStreamGuard stream_guard(at::cuda::getCurrentCUDAStream(ready.get_device()));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream(ready.get_device()).stream();
+  int32_t B = (int32_t)req_ids.size(0);
+  int32_t R = (int32_t)ready.size(0);
+  int threads = 128;
+  int blocks = (B + threads - 1) / threads;
+  mac_invalidate_persistent_ready_kernel<<<blocks, threads, 0, stream>>>(
+      ready.data_ptr<bool>(),
+      cache_epoch.data_ptr<int64_t>(),
+      request_epoch.data_ptr<int64_t>(),
+      req_ids.data_ptr<int32_t>(),
+      B,
+      R);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void mac_update_request_state(Tensor req_len,
+                              Tensor match_req_len,
+                              Tensor cache_lens,
+                              Tensor req_ids,
+                              Tensor seq_lens,
+                              Tensor cur_lens) {
+  if (req_ids.size(0) == 0) return;
+  CHECK_CUDA(req_len);
+  CHECK_CONTIG(req_len);
+  CHECK_DTYPE(req_len, torch::kInt32);
+  CHECK_CUDA(match_req_len);
+  CHECK_CONTIG(match_req_len);
+  CHECK_DTYPE(match_req_len, torch::kInt32);
+  CHECK_CUDA(cache_lens);
+  CHECK_CONTIG(cache_lens);
+  CHECK_DTYPE(cache_lens, torch::kInt32);
+  CHECK_CUDA(req_ids);
+  CHECK_CONTIG(req_ids);
+  CHECK_DTYPE(req_ids, torch::kInt32);
+  CHECK_CUDA(seq_lens);
+  CHECK_CONTIG(seq_lens);
+  CHECK_DTYPE(seq_lens, torch::kInt32);
+  CHECK_CUDA(cur_lens);
+  CHECK_CONTIG(cur_lens);
+  CHECK_DTYPE(cur_lens, torch::kInt32);
+  TORCH_CHECK(match_req_len.size(0) == req_len.size(0), "match_req_len must match req_len");
+  TORCH_CHECK(seq_lens.size(0) >= req_ids.size(0), "seq_lens is shorter than req_ids");
+  TORCH_CHECK(cur_lens.size(0) >= req_ids.size(0), "cur_lens is shorter than req_ids");
+  TORCH_CHECK(cache_lens.size(0) >= req_ids.size(0), "cache_lens is shorter than req_ids");
+
+  c10::cuda::CUDAGuard dev_guard(req_len.device());
+  c10::cuda::CUDAStreamGuard stream_guard(at::cuda::getCurrentCUDAStream(req_len.get_device()));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream(req_len.get_device()).stream();
+  int32_t B = (int32_t)req_ids.size(0);
+  int32_t R = (int32_t)req_len.size(0);
+  int threads = 128;
+  int blocks = (B + threads - 1) / threads;
+  mac_update_request_state_kernel<<<blocks, threads, 0, stream>>>(
+      req_len.data_ptr<int32_t>(),
+      match_req_len.data_ptr<int32_t>(),
+      cache_lens.data_ptr<int32_t>(),
+      req_ids.data_ptr<int32_t>(),
+      seq_lens.data_ptr<int32_t>(),
+      cur_lens.data_ptr<int32_t>(),
+      B,
+      R);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 // --------------------------------- pybind ---------------------------------
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("mac_prefill_update_cache",
         &mac_prefill_update_cache,
         "Cooperative MAC ring cache update (row-parallel, in-kernel length bump)");
+  m.def("mac_mark_persistent_ready",
+        &mac_mark_persistent_ready,
+        "Guarded MAC persistent-cache ready marker");
+  m.def("mac_invalidate_persistent_ready",
+        &mac_invalidate_persistent_ready,
+        "Guarded MAC persistent-cache invalidation");
+  m.def("mac_update_request_state",
+        &mac_update_request_state,
+        "Guarded MAC request length/cache length metadata update");
 }

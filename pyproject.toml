@@ -10,7 +10,22 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
 authors = [{name = "MAC-Attention Contributors"}]
-dependencies = []
+dependencies = [
+  "filelock",
+  "torch",
+]
+
+[project.optional-dependencies]
+sglang = [
+  "sglang",
+  "flashinfer-python>=0.6.3",
+]
+
+[project.scripts]
+mac-sglang-launch = "mac_attention.integrations.sglang.launch_server:main"
+
+[project.entry-points."sglang.srt.plugins"]
+mac_attention = "mac_attention.integrations.sglang.plugin:register_plugin"
 
 [tool.setuptools]
 package-dir = {"" = "attention/src"}

@@ -20,6 +20,7 @@ class HookSpec:
     target: str
     hook: Callable[..., Any]
     kind: HookKind
+    optional: bool = False
 
 
 def _profiling_enabled() -> bool:
@@ -33,13 +34,25 @@ def _profiling_enabled() -> bool:
     }
 
 
+def _graph_trace_enabled() -> bool:
+    return os.environ.get("MAC_DEBUG_GRAPH_TRACE", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def iter_hook_specs() -> Iterable[HookSpec]:
     from .flashinfer_hooks import (
         flashinfer_backend_init_after,
         flashinfer_forward_decode_around,
         flashinfer_forward_extend_around,
+        flashinfer_init_forward_metadata_capture_cuda_graph_around,
         flashinfer_init_forward_metadata_around,
+        flashinfer_init_forward_metadata_replay_cuda_graph_around,
     )
+    from .cuda_graph_hooks import cuda_graph_capture_one_batch_size_around
     from .llama_hooks import (
         llama_attention_forward_around,
         llama_attention_init_after,
@@ -90,6 +103,7 @@ def iter_hook_specs() -> Iterable[HookSpec]:
         "sglang.srt.managers.schedule_batch:ScheduleBatch.get_model_worker_batch",
         schedule_get_model_worker_batch_after,
         "after",
+        optional=True,
     )
     yield HookSpec(
         "sglang.srt.model_executor.forward_batch_info:ForwardBatch.init_new",
@@ -107,12 +121,13 @@ def iter_hook_specs() -> Iterable[HookSpec]:
         llama_attention_forward_around,
         "around",
     )
-    if _profiling_enabled():
+    if _profiling_enabled() or _graph_trace_enabled():
         yield HookSpec(
             "sglang.srt.models.llama:LlamaDecoderLayer.forward",
             llama_decoder_layer_forward_around,
             "around",
         )
+    if _profiling_enabled():
         yield HookSpec(
             "sglang.srt.models.llama:LlamaMLP.forward",
             llama_mlp_forward_around,
@@ -141,6 +156,18 @@ def iter_hook_specs() -> Iterable[HookSpec]:
         "around",
     )
     yield HookSpec(
+        "sglang.srt.layers.attention.flashinfer_backend:FlashInferAttnBackend.init_forward_metadata_capture_cuda_graph",
+        flashinfer_init_forward_metadata_capture_cuda_graph_around,
+        "around",
+        optional=True,
+    )
+    yield HookSpec(
+        "sglang.srt.layers.attention.flashinfer_backend:FlashInferAttnBackend.init_forward_metadata_replay_cuda_graph",
+        flashinfer_init_forward_metadata_replay_cuda_graph_around,
+        "around",
+        optional=True,
+    )
+    yield HookSpec(
         "sglang.srt.layers.attention.flashinfer_backend:FlashInferAttnBackend.forward_decode",
         flashinfer_forward_decode_around,
         "around",
@@ -150,6 +177,13 @@ def iter_hook_specs() -> Iterable[HookSpec]:
         flashinfer_forward_extend_around,
         "around",
     )
+    if _graph_trace_enabled():
+        yield HookSpec(
+            "sglang.srt.model_executor.cuda_graph_runner:CudaGraphRunner.capture_one_batch_size",
+            cuda_graph_capture_one_batch_size_around,
+            "around",
+            optional=True,
+        )
 
 
 def _resolve_target(target: str) -> tuple[Any, str]:
@@ -216,7 +250,11 @@ def _install_hook(spec: HookSpec) -> bool:
     parent, attr_name = _resolve_target(spec.target)
     raw_descriptor = parent.__dict__.get(attr_name)
     if raw_descriptor is None:
-        raw_descriptor = getattr(parent, attr_name)
+        raw_descriptor = getattr(parent, attr_name, None)
+    if raw_descriptor is None:
+        if spec.optional:
+            return False
+        raise AttributeError(f"{parent!r} has no attribute {attr_name!r}")
 
     current_fn = _descriptor_function(raw_descriptor)
     if getattr(current_fn, "__mac_attention_hooked__", False):

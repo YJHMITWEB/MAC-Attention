@@ -1,0 +1,194 @@
+[
+  {
+    "target_context_len": 65536,
+    "used_context_len": 65536,
+    "raw_prompt_tokens": 65582,
+    "sample_index": 125,
+    "_id": "66f950acbb02136c067c5021",
+    "length": "medium",
+    "domain": "Single-Document QA",
+    "concurrency": 1,
+    "batch_wall_s": 8.67213374900166,
+    "mean_request_latency_s": 8.67091966496082,
+    "max_request_latency_s": 8.67091966496082,
+    "total_completion_tokens": 64,
+    "aggregate_decode_tokens_per_s": 7.379959978980688,
+    "statuses": [
+      200
+    ],
+    "error_count": 0,
+    "errors": [],
+    "decode_log_rates_tokens_per_s": [
+      0.98,
+      68.77,
+      68.71,
+      67.72
+    ],
+    "decode_log_interval_count": 4,
+    "decode_log_steady_mean_tokens_per_s": 68.39999999999999,
+    "decode_log_steady_min_tokens_per_s": 67.72,
+    "decode_log_steady_max_tokens_per_s": 68.77,
+    "mode": "baseline",
+    "server_log": "/home/users/jyao/ai_general_research/minorTest/benchmark/LongBench/portable_plugin_full_repro_20260517_153819/controlled_latency_c1_direct_llama_attention/baseline_c1.server.log"
+  },
+  {
+    "target_context_len": 98304,
+    "used_context_len": 98304,
+    "raw_prompt_tokens": 98608,
+    "sample_index": 469,
+    "_id": "66ec31eb821e116aacb1bf28",
+    "length": "medium",
+    "domain": "Single-Document QA",
+    "concurrency": 1,
+    "batch_wall_s": 16.87580874399282,
+    "mean_request_latency_s": 16.87509944703197,
+    "max_request_latency_s": 16.87509944703197,
+    "total_completion_tokens": 64,
+    "aggregate_decode_tokens_per_s": 3.7924108391416613,
+    "statuses": [
+      200
+    ],
+    "error_count": 0,
+    "errors": [],
+    "decode_log_rates_tokens_per_s": [
+      0.98,
+      59.46,
+      59.42,
+      59.66
+    ],
+    "decode_log_interval_count": 4,
+    "decode_log_steady_mean_tokens_per_s": 59.513333333333335,
+    "decode_log_steady_min_tokens_per_s": 59.42,
+    "decode_log_steady_max_tokens_per_s": 59.66,
+    "mode": "baseline",
+    "server_log": "/home/users/jyao/ai_general_research/minorTest/benchmark/LongBench/portable_plugin_full_repro_20260517_153819/controlled_latency_c1_direct_llama_attention/baseline_c1.server.log"
+  },
+  {
+    "target_context_len": 126976,
+    "used_context_len": 126976,
+    "raw_prompt_tokens": 129587,
+    "sample_index": 413,
+    "_id": "66fa415cbb02136c067c671c",
+    "length": "medium",
+    "domain": "Multi-Document QA",
+    "concurrency": 1,
+    "batch_wall_s": 26.42706314800307,
+    "mean_request_latency_s": 26.426394790993072,
+    "max_request_latency_s": 26.426394790993072,
+    "total_completion_tokens": 64,
+    "aggregate_decode_tokens_per_s": 2.4217598316382,
+    "statuses": [
+      200
+    ],
+    "error_count": 0,
+    "errors": [],
+    "decode_log_rates_tokens_per_s": [
+      0.62,
+      52.88,
+      52.92,
+      52.92
+    ],
+    "decode_log_interval_count": 4,
+    "decode_log_steady_mean_tokens_per_s": 52.906666666666666,
+    "decode_log_steady_min_tokens_per_s": 52.88,
+    "decode_log_steady_max_tokens_per_s": 52.92,
+    "mode": "baseline",
+    "server_log": "/home/users/jyao/ai_general_research/minorTest/benchmark/LongBench/portable_plugin_full_repro_20260517_153819/controlled_latency_c1_direct_llama_attention/baseline_c1.server.log"
+  },
+  {
+    "target_context_len": 65536,
+    "used_context_len": 65536,
+    "raw_prompt_tokens": 65582,
+    "sample_index": 125,
+    "_id": "66f950acbb02136c067c5021",
+    "length": "medium",
+    "domain": "Single-Document QA",
+    "concurrency": 1,
+    "batch_wall_s": 8.911415003007278,
+    "mean_request_latency_s": 8.910807994951028,
+    "max_request_latency_s": 8.910807994951028,
+    "total_completion_tokens": 64,
+    "aggregate_decode_tokens_per_s": 7.181799969859145,
+    "statuses": [
+      200
+    ],
+    "error_count": 0,
+    "errors": [],
+    "decode_log_rates_tokens_per_s": [
+      0.14,
+      65.48,
+      64.88,
+      63.14
+    ],
+    "decode_log_interval_count": 4,
+    "decode_log_steady_mean_tokens_per_s": 64.5,
+    "decode_log_steady_min_tokens_per_s": 63.14,
+    "decode_log_steady_max_tokens_per_s": 65.48,
+    "mode": "mac",
+    "server_log": "/home/users/jyao/ai_general_research/minorTest/benchmark/LongBench/portable_plugin_full_repro_20260517_153819/controlled_latency_c1_direct_llama_attention/mac_c1.server.log"
+  },
+  {
+    "target_context_len": 98304,
+    "used_context_len": 98304,
+    "raw_prompt_tokens": 98608,
+    "sample_index": 469,
+    "_id": "66ec31eb821e116aacb1bf28",
+    "length": "medium",
+    "domain": "Single-Document QA",
+    "concurrency": 1,
+    "batch_wall_s": 17.069499296951108,
+    "mean_request_latency_s": 17.068794458988123,
+    "max_request_latency_s": 17.068794458988123,
+    "total_completion_tokens": 64,
+    "aggregate_decode_tokens_per_s": 3.7493776991707923,
+    "statuses": [
+      200
+    ],
+    "error_count": 0,
+    "errors": [],
+    "decode_log_rates_tokens_per_s": [
+      0.97,
+      64.58,
+      63.12,
+      61.66
+    ],
+    "decode_log_interval_count": 4,
+    "decode_log_steady_mean_tokens_per_s": 63.12,
+    "decode_log_steady_min_tokens_per_s": 61.66,
+    "decode_log_steady_max_tokens_per_s": 64.58,
+    "mode": "mac",
+    "server_log": "/home/users/jyao/ai_general_research/minorTest/benchmark/LongBench/portable_plugin_full_repro_20260517_153819/controlled_latency_c1_direct_llama_attention/mac_c1.server.log"
+  },
+  {
+    "target_context_len": 126976,
+    "used_context_len": 126976,
+    "raw_prompt_tokens": 129587,
+    "sample_index": 413,
+    "_id": "66fa415cbb02136c067c671c",
+    "length": "medium",
+    "domain": "Multi-Document QA",
+    "concurrency": 1,
+    "batch_wall_s": 26.68702208099421,
+    "mean_request_latency_s": 26.68646852398524,
+    "max_request_latency_s": 26.68646852398524,
+    "total_completion_tokens": 64,
+    "aggregate_decode_tokens_per_s": 2.3981694100511537,
+    "statuses": [
+      200
+    ],
+    "error_count": 0,
+    "errors": [],
+    "decode_log_rates_tokens_per_s": [
+      0.61,
+      63.9,
+      60.25,
+      63.33
+    ],
+    "decode_log_interval_count": 4,
+    "decode_log_steady_mean_tokens_per_s": 62.49333333333333,
+    "decode_log_steady_min_tokens_per_s": 60.25,
+    "decode_log_steady_max_tokens_per_s": 63.9,
+    "mode": "mac",
+    "server_log": "/home/users/jyao/ai_general_research/minorTest/benchmark/LongBench/portable_plugin_full_repro_20260517_153819/controlled_latency_c1_direct_llama_attention/mac_c1.server.log"
+  }
+]

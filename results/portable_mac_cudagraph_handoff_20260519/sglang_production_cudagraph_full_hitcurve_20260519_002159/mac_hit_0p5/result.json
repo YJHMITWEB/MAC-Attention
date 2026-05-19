@@ -1,0 +1,198 @@
+{
+  "timestamp": "20260519_004620",
+  "model": "/storage/users/jyao/ai_general_research/minorTest/models/Llama-3.1-8B-Instruct",
+  "out_dir": "results/sglang_production_cudagraph_full_hitcurve_20260519_002159/mac_hit_0p5",
+  "max_new_tokens": 128,
+  "ignore_eos": true,
+  "mac_bench": {
+    "mode": "synthetic_head",
+    "hit_rate": 0.5,
+    "hit_rate_std": 0.0,
+    "skip_ratio": -1.0,
+    "skip_ratio_std": 0.0,
+    "match_lag_mean": 64.0,
+    "match_lag_std": 0.0,
+    "seed": 1
+  },
+  "prompts": [
+    {
+      "target_context_len": 65536,
+      "used_context_len": 65536,
+      "raw_prompt_tokens": 65582,
+      "sample_index": 125,
+      "_id": "66f950acbb02136c067c5021",
+      "length": "medium",
+      "domain": "Single-Document QA"
+    },
+    {
+      "target_context_len": 73728,
+      "used_context_len": 73728,
+      "raw_prompt_tokens": 73993,
+      "sample_index": 55,
+      "_id": "66f4cd2c821e116aacb316ef",
+      "length": "medium",
+      "domain": "Single-Document QA"
+    },
+    {
+      "target_context_len": 98304,
+      "used_context_len": 98304,
+      "raw_prompt_tokens": 98608,
+      "sample_index": 469,
+      "_id": "66ec31eb821e116aacb1bf28",
+      "length": "medium",
+      "domain": "Single-Document QA"
+    },
+    {
+      "target_context_len": 126976,
+      "used_context_len": 126976,
+      "raw_prompt_tokens": 129587,
+      "sample_index": 413,
+      "_id": "66fa415cbb02136c067c671c",
+      "length": "medium",
+      "domain": "Multi-Document QA"
+    }
+  ],
+  "latency": [
+    {
+      "target_context_len": 65536,
+      "used_context_len": 65536,
+      "raw_prompt_tokens": 65582,
+      "sample_index": 125,
+      "_id": "66f950acbb02136c067c5021",
+      "length": "medium",
+      "domain": "Single-Document QA",
+      "concurrency": 1,
+      "batch_wall_s": 10.017715097987093,
+      "mean_request_latency_s": 10.016648893011734,
+      "max_request_latency_s": 10.016648893011734,
+      "total_completion_tokens": 128,
+      "aggregate_decode_tokens_per_s": 12.777364773102766,
+      "statuses": [
+        200
+      ],
+      "error_count": 0,
+      "errors": [],
+      "decode_log_rates_tokens_per_s": [
+        0.66,
+        59.0,
+        58.99,
+        58.98,
+        58.98,
+        58.99,
+        58.97
+      ],
+      "decode_log_interval_count": 7,
+      "decode_log_steady_mean_tokens_per_s": 58.985,
+      "decode_log_steady_min_tokens_per_s": 58.97,
+      "decode_log_steady_max_tokens_per_s": 59.0,
+      "mode": "mac",
+      "server_log": "results/sglang_production_cudagraph_full_hitcurve_20260519_002159/mac_hit_0p5/mac_c1.server.log"
+    },
+    {
+      "target_context_len": 73728,
+      "used_context_len": 73728,
+      "raw_prompt_tokens": 73993,
+      "sample_index": 55,
+      "_id": "66f4cd2c821e116aacb316ef",
+      "length": "medium",
+      "domain": "Single-Document QA",
+      "concurrency": 1,
+      "batch_wall_s": 11.997412123018876,
+      "mean_request_latency_s": 11.996757056040224,
+      "max_request_latency_s": 11.996757056040224,
+      "total_completion_tokens": 128,
+      "aggregate_decode_tokens_per_s": 10.668967497950026,
+      "statuses": [
+        200
+      ],
+      "error_count": 0,
+      "errors": [],
+      "decode_log_rates_tokens_per_s": [
+        1.57,
+        56.47,
+        56.46,
+        56.59,
+        56.55,
+        56.36,
+        56.34
+      ],
+      "decode_log_interval_count": 7,
+      "decode_log_steady_mean_tokens_per_s": 56.461666666666666,
+      "decode_log_steady_min_tokens_per_s": 56.34,
+      "decode_log_steady_max_tokens_per_s": 56.59,
+      "mode": "mac",
+      "server_log": "results/sglang_production_cudagraph_full_hitcurve_20260519_002159/mac_hit_0p5/mac_c1.server.log"
+    },
+    {
+      "target_context_len": 98304,
+      "used_context_len": 98304,
+      "raw_prompt_tokens": 98608,
+      "sample_index": 469,
+      "_id": "66ec31eb821e116aacb1bf28",
+      "length": "medium",
+      "domain": "Single-Document QA",
+      "concurrency": 1,
+      "batch_wall_s": 18.61065603303723,
+      "mean_request_latency_s": 18.609950475976802,
+      "max_request_latency_s": 18.609950475976802,
+      "total_completion_tokens": 128,
+      "aggregate_decode_tokens_per_s": 6.877780115476703,
+      "statuses": [
+        200
+      ],
+      "error_count": 0,
+      "errors": [],
+      "decode_log_rates_tokens_per_s": [
+        0.96,
+        50.98,
+        50.94,
+        50.91,
+        50.85,
+        50.87,
+        50.79
+      ],
+      "decode_log_interval_count": 7,
+      "decode_log_steady_mean_tokens_per_s": 50.89,
+      "decode_log_steady_min_tokens_per_s": 50.79,
+      "decode_log_steady_max_tokens_per_s": 50.98,
+      "mode": "mac",
+      "server_log": "results/sglang_production_cudagraph_full_hitcurve_20260519_002159/mac_hit_0p5/mac_c1.server.log"
+    },
+    {
+      "target_context_len": 126976,
+      "used_context_len": 126976,
+      "raw_prompt_tokens": 129587,
+      "sample_index": 413,
+      "_id": "66fa415cbb02136c067c671c",
+      "length": "medium",
+      "domain": "Multi-Document QA",
+      "concurrency": 1,
+      "batch_wall_s": 28.557110567984637,
+      "mean_request_latency_s": 28.556457761966158,
+      "max_request_latency_s": 28.556457761966158,
+      "total_completion_tokens": 128,
+      "aggregate_decode_tokens_per_s": 4.482246188572759,
+      "statuses": [
+        200
+      ],
+      "error_count": 0,
+      "errors": [],
+      "decode_log_rates_tokens_per_s": [
+        0.61,
+        46.13,
+        46.06,
+        46.03,
+        46.02,
+        46.0,
+        45.9
+      ],
+      "decode_log_interval_count": 7,
+      "decode_log_steady_mean_tokens_per_s": 46.02333333333333,
+      "decode_log_steady_min_tokens_per_s": 45.9,
+      "decode_log_steady_max_tokens_per_s": 46.13,
+      "mode": "mac",
+      "server_log": "results/sglang_production_cudagraph_full_hitcurve_20260519_002159/mac_hit_0p5/mac_c1.server.log"
+    }
+  ],
+  "latency_speedups": []
+}

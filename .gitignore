@@ -12,10 +12,18 @@ dist/
 *.tmp
 *.swp
 .venv/
-results/
 profiles/
 *.ncu-rep
 *.nsys-rep
 *.qdrep
 *.sqlite
 *.log
+
+# Keep scratch benchmark outputs out of the public repo by default, but track
+# the curated portable-plugin result bundles referenced by the README.
+results/*
+!results/README.md
+!results/portable_mac_cudagraph_handoff_20260519/
+!results/portable_mac_cudagraph_handoff_20260519/**
+!results/portable_plugin_hook_gap_20260517/
+!results/portable_plugin_hook_gap_20260517/**

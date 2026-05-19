@@ -54,7 +54,7 @@ MODEL_PATH = Path(
 API_KEY = "token-abc123"
 
 DECODE_THROUGHPUT_PATTERN = re.compile(
-    r"Decode batch, .*?gen throughput \(token/s\):\s*([0-9.]+)"
+    r"Decode batch, .*?#token:\s*([0-9]+), .*?gen throughput \(token/s\):\s*([0-9.]+)"
 )
 
 
@@ -109,7 +109,7 @@ def server_env(mode: str, args: argparse.Namespace) -> dict[str, str]:
         f"{MAC_ATTENTION_ROOT / 'src'}:{SGLANG_ROOT / 'python'}:"
         f"{env.get('PYTHONPATH', '')}"
     )
-    env["MAC_WORKSPACE_BASE"] = str(MAC_ATTENTION_ROOT)
+    env.setdefault("MAC_WORKSPACE_BASE", str(MAC_ATTENTION_ROOT))
     env["TVM_FFI_GPU_BACKEND"] = "cuda"
     env.setdefault("CUDA_VISIBLE_DEVICES", "0")
     env.setdefault("TORCH_EXTENSIONS_DIR", str(MAC_ATTENTION_ROOT / ".torch_extensions"))
@@ -131,7 +131,7 @@ def server_env(mode: str, args: argparse.Namespace) -> dict[str, str]:
         env["MAC_LOOKBACK_TOKENS_RIGHT"] = "0"
         env["MAC_GEN_MIN_LIMIT"] = "2048"
         env["MAC_SEMANTIC_POS_AHEAD"] = "256"
-        env["MAC_DISABLE_CUDA_GRAPH"] = "1"
+        env["MAC_DISABLE_CUDA_GRAPH"] = "0" if args.enable_cuda_graph else "1"
         env["MAC_FORCE_PAGED_PREFILL"] = "1"
         env["MAC_PERSISTENT_COOP"] = "1"
         env["MAC_PERSISTENT_MAX_CONTEXT"] = "131072"
@@ -165,6 +165,7 @@ def server_env(mode: str, args: argparse.Namespace) -> dict[str, str]:
         env.pop("MAC_ATTENTION_PORTABLE_PLUGIN", None)
         env.pop("SGLANG_LAUNCH_MODULE", None)
         env.pop("MAC_ATTENTION_SGLANG_CONFIG", None)
+        env["SGLANG_PLUGINS"] = "__none__"
     return env
 
 
@@ -191,8 +192,8 @@ def server_cmd(mode: str, port: int, max_running: int, args: argparse.Namespace)
         str(port),
         "--api-key",
         API_KEY,
+        "--skip-server-warmup",
         "--disable-chunked-prefix-cache",
-        "--disable-cuda-graph",
         "--disable-radix-cache",
         "--page-size",
         "1",
@@ -203,6 +204,19 @@ def server_cmd(mode: str, port: int, max_running: int, args: argparse.Namespace)
         "--decode-log-interval",
         str(args.decode_log_interval),
     ]
+    if not args.enable_cuda_graph:
+        cmd.append("--disable-cuda-graph")
+    if args.enable_cuda_graph:
+        for flag_name, value in (
+            ("--cuda-graph-bs", args.cuda_graph_bs),
+            ("--piecewise-cuda-graph-tokens", args.piecewise_cuda_graph_tokens),
+        ):
+            values = _split_cli_values(value)
+            if values:
+                cmd.append(flag_name)
+                cmd.extend(values)
+        if args.disable_piecewise_cuda_graph:
+            cmd.append("--disable-piecewise-cuda-graph")
     if mode == "mac" and not args.portable_mac_plugin:
         cmd.extend(
             [
@@ -220,8 +234,6 @@ def server_cmd(mode: str, port: int, max_running: int, args: argparse.Namespace)
                 "256",
                 "--mac-profile",
                 "0",
-                "--mac-disable-cuda-graph",
-                "true",
                 "--mac-force-paged-prefill",
                 "true",
                 "--mac-persistent-coop",
@@ -248,6 +260,12 @@ def server_cmd(mode: str, port: int, max_running: int, args: argparse.Namespace)
                 "true",
             ]
         )
+        cmd.extend(
+            [
+                "--mac-disable-cuda-graph",
+                "false" if args.enable_cuda_graph else "true",
+            ]
+        )
         if args.mac_bench_mode != "off":
             cmd.extend(
                 [
@@ -270,6 +288,13 @@ def server_cmd(mode: str, port: int, max_running: int, args: argparse.Namespace)
                 ]
             )
     return cmd
+
+
+def _split_cli_values(value: str) -> list[str]:
+    value = str(value or "").strip()
+    if not value:
+        return []
+    return [part for part in value.replace(",", " ").split() if part]
 
 
 def wait_for_server(port: int, timeout_s: float) -> None:
@@ -506,7 +531,10 @@ def parse_decode_rates(log_path: Path, start_offset: int = 0) -> list[float]:
     rates: list[float] = []
     for match in DECODE_THROUGHPUT_PATTERN.finditer(text):
         try:
-            rates.append(float(match.group(1)))
+            token_count = int(match.group(1))
+            if token_count <= 0:
+                continue
+            rates.append(float(match.group(2)))
         except ValueError:
             pass
     return rates
@@ -579,6 +607,27 @@ def run_sweep(args: argparse.Namespace, prompts: list[dict[str, Any]], out_dir: 
             proc: subprocess.Popen | None = None
             try:
                 proc = start_server(mode, port, concurrency, log_path, args)
+                if args.long_warmup_tokens > 0 and prompts:
+                    warm_prompt = prompts[0]
+                    print(
+                        f"[long-warmup] mode={mode} c={concurrency} "
+                        f"context={warm_prompt['used_context_len']} "
+                        f"tokens={args.long_warmup_tokens}",
+                        flush=True,
+                    )
+                    warm = run_generate_request(
+                        port,
+                        warm_prompt["input_ids"],
+                        int(args.long_warmup_tokens),
+                        True,
+                        args.request_timeout_s,
+                    )
+                    if int(warm.get("status", -1)) != 200:
+                        raise RuntimeError(
+                            "long warmup failed: "
+                            f"mode={mode} c={concurrency} result={warm}"
+                        )
+                    time.sleep(0.2)
                 for prompt in prompts:
                     active_tokens = concurrency * (
                         int(prompt["used_context_len"]) + args.max_new_tokens
@@ -692,11 +741,37 @@ def main() -> None:
     )
     parser.add_argument("--chars-per-token", type=float, default=4.0)
     parser.add_argument("--port", type=int, default=21131)
-    parser.add_argument("--server-timeout-s", type=float, default=300.0)
+    parser.add_argument("--server-timeout-s", type=float, default=1200.0)
     parser.add_argument("--request-timeout-s", type=float, default=1800.0)
     parser.add_argument("--decode-log-interval", type=int, default=16)
+    parser.add_argument(
+        "--long-warmup-tokens",
+        type=int,
+        default=0,
+        help="Run the first selected long prompt once after server startup and discard it.",
+    )
     parser.add_argument("--chunked-prefill-size", type=int, default=8192)
     parser.add_argument("--mem-fraction-static", type=float, default=0.70)
+    parser.add_argument(
+        "--enable-cuda-graph",
+        action="store_true",
+        help="Do not pass --disable-cuda-graph and allow MAC hooks to keep CUDA graph enabled.",
+    )
+    parser.add_argument(
+        "--cuda-graph-bs",
+        default="",
+        help="Optional SGLang --cuda-graph-bs values for CUDA-graph runs, e.g. '1' or '1,2,4'.",
+    )
+    parser.add_argument(
+        "--piecewise-cuda-graph-tokens",
+        default="",
+        help="Optional SGLang --piecewise-cuda-graph-tokens values for CUDA-graph runs, e.g. '8192'.",
+    )
+    parser.add_argument(
+        "--disable-piecewise-cuda-graph",
+        action="store_true",
+        help="Keep decode CUDA graph enabled but disable SGLang piecewise prefill CUDA graph.",
+    )
     parser.add_argument("--mac-tile-tokens", type=int, default=32)
     parser.add_argument("--mac-match-tile-slots", type=int, default=32)
     parser.add_argument("--mac-threshold", type=float, default=0.45)

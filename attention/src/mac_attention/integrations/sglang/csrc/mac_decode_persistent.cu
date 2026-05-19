@@ -318,9 +318,7 @@ __device__ __forceinline__ bool complete_group_direct_z2_selected(
 __device__ __forceinline__ bool tail_group_direct_z2_active(
     const Params& p, const int32_t* __restrict__ task_counts) {
   if (!tail_group_direct_z2_enabled(p) || task_counts == nullptr) return false;
-  int total_groups = p.N * p.Hkv;
-  int full_groups = task_counts[6];
-  return full_groups > 0 && full_groups * 4 >= total_groups * 3;
+  return task_counts[1] > 0;
 }
 
 __device__ __forceinline__ int rect_reduce_chunk_for_mode(const Params& p, int mode) {
@@ -437,7 +435,15 @@ __device__ __forceinline__ int full_fallback_tile_tokens_for_mixed_schedule(
   }
 
   int target_ctas = dense_full_fallback_target_ctas_for(p, task_counts);
-
+  if (full_fallback_groups * 2 <= total_groups) {
+    int sparse_target = p.full_fallback_target_ctas;
+    if (sparse_target <= 0) sparse_target = static_cast<int>(gridDim.x);
+    if (sparse_target < 1) sparse_target = 1;
+    sparse_target += max(1, sparse_target / 4);
+    if (target_ctas < sparse_target) {
+      target_ctas = sparse_target;
+    }
+  }
   long long raw =
       (static_cast<long long>(rect_tokens) * static_cast<long long>(full_fallback_groups) +
        static_cast<long long>(target_ctas) - 1LL) /
@@ -678,19 +684,15 @@ __device__ void phase1_match_scan(
     int32_t* __restrict__ match_slot) {
   const int total = p.N * p.Hq * p.max_match_tiles;
   const int warps = blockDim.x >> 5;
-  __shared__ float sh_dist[kMaxWarps];
-  __shared__ int sh_pos[kMaxWarps];
-  __shared__ int sh_slot[kMaxWarps];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
 
-  for (int task = blockIdx.x; task < total; task += gridDim.x) {
+  for (int task = blockIdx.x * warps + warp; task < total; task += gridDim.x * warps) {
     int t = task;
     int tile = t % p.max_match_tiles;
     t /= p.max_match_tiles;
     int hq = t % p.Hq;
     int n = t / p.Hq;
-
-    const int lane = threadIdx.x & 31;
-    const int warp = threadIdx.x >> 5;
 
     int past_len = past_lens[n];
     int candidate_begin = max(0, past_len - p.M);
@@ -719,7 +721,7 @@ __device__ void phase1_match_scan(
       }
     }
 
-    for (int slot = slot_begin + warp; slot < slot_end; slot += warps) {
+    for (int slot = slot_begin; slot < slot_end; ++slot) {
       int logical_pos = ring_slot_to_pos(past_len, p.M, slot);
       bool valid = eligible && logical_pos >= candidate_begin && logical_pos < candidate_end;
       float acc = 0.0f;
@@ -752,30 +754,13 @@ __device__ void phase1_match_scan(
     }
 
     if (lane == 0) {
-      sh_dist[warp] = best_d;
-      sh_pos[warp] = best_p;
-      sh_slot[warp] = best_s;
-    }
-    __syncthreads();
-
-    if (threadIdx.x == 0) {
-      float bd = kInf;
-      int bp = INT_MAX;
-      int bs = -1;
-      for (int w = 0; w < warps; ++w) {
-        if (better_pair(sh_dist[w], sh_pos[w], bd, bp)) {
-          bd = sh_dist[w];
-          bp = sh_pos[w];
-          bs = sh_slot[w];
-        }
-      }
       int64_t off = (static_cast<int64_t>(n) * p.Hq + hq) * p.max_match_tiles + tile;
-      match_dist[off] = bd;
-      match_pos[off] = bp;
-      match_slot[off] = bs;
+      match_dist[off] = best_d;
+      match_pos[off] = best_p;
+      match_slot[off] = best_s;
     }
-    __syncthreads();
   }
+  __syncthreads();
 }
 
 __device__ void phase2_reduce_schedule(
@@ -1201,7 +1186,12 @@ __device__ void phase2_reduce_schedule(
         __syncthreads();
         int32_t task_go_value = static_cast<int32_t>(go);
         if (mode == kGroupModeMixedFallback) {
-          task_go_value = static_cast<int32_t>(go + group_total);
+          if (mixed_misspack_z2_enabled(p) && miss_heads > 0 &&
+              miss_heads * 2 <= p.group_size) {
+            task_go_value = static_cast<int32_t>(go + group_total * 2);
+          } else {
+            task_go_value = static_cast<int32_t>(go + group_total);
+          }
         }
         for (int tile = threadIdx.x; tile < rect_tiles; tile += blockDim.x) {
           int idx = sh_z2_base + tile;
@@ -1468,7 +1458,7 @@ __device__ void phase_attention_tiles_compact(
 
     int64_t go = static_cast<int64_t>(encoded_task);
     if constexpr (IsTail) {
-      if (tail_group_direct_z2_on && group_mode[go] == kGroupModeFullFallback) {
+      if (tail_group_direct_z2_on) {
         continue;
       }
     }
@@ -1779,6 +1769,9 @@ __device__ void phase_complete_attention_group_direct_z2(
       cp_async_commit();
 
       if (!mixed_z2 && stage_count == kStageTokens) {
+        float scores[kGroup];
+        float betas[kGroup];
+        float tile_m = -kInf;
 #pragma unroll
         for (int j = 0; j < kGroup; ++j) {
           int slot = tz * kGroup + j;
@@ -1792,17 +1785,36 @@ __device__ void phase_complete_attention_group_direct_z2(
           }
           dot = subwarp16_xor_sum(dot, subwarp_mask);
           float score = dot * score_scale;
-          float new_m = fmaxf(m, score);
-          float alpha = has_value ? ptx_exp2_approx(m - new_m) : 0.0f;
-          float beta = ptx_exp2_approx(score - new_m);
+          scores[j] = score;
+          tile_m = fmaxf(tile_m, score);
+        }
+        float new_m = has_value ? fmaxf(m, tile_m) : tile_m;
+        float alpha = has_value ? ptx_exp2_approx(m - new_m) : 0.0f;
+        float beta_sum = 0.0f;
+#pragma unroll
+        for (int j = 0; j < kGroup; ++j) {
+          float beta = ptx_exp2_approx(scores[j] - new_m);
+          betas[j] = beta;
+          beta_sum += beta;
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          o_vals[i] *= alpha;
+        }
+#pragma unroll
+        for (int j = 0; j < kGroup; ++j) {
+          int slot = tz * kGroup + j;
+          int sh_off = cur_buf * kStageTokens * p.D + slot * p.D + dim_base;
+          Bf16x8 v_vec = load_bf16x8(&sh_v[sh_off]);
+          float beta = betas[j];
 #pragma unroll
           for (int i = 0; i < 8; ++i) {
-            o_vals[i] = fmaf(beta, bf16_to_float(v_vec.v[i]), o_vals[i] * alpha);
+            o_vals[i] = fmaf(beta, bf16_to_float(v_vec.v[i]), o_vals[i]);
           }
-          denom = denom * alpha + beta;
-          m = new_m;
-          has_value = true;
         }
+        denom = denom * alpha + beta_sum;
+        m = new_m;
+        has_value = true;
       } else if (!mixed_z2) {
 #pragma unroll
         for (int j = 0; j < kGroup; ++j) {
@@ -1831,7 +1843,8 @@ __device__ void phase_complete_attention_group_direct_z2(
           }
         }
       } else if (misspack_z2 && stage_count == kStageTokens) {
-        for (int j = local_miss_part; j < kGroup; j += lanes_per_miss_head) {
+        for (int j = local_miss_part; j < kGroup;
+             j += lanes_per_miss_head) {
           int slot = tz * kGroup + j;
           int pos = stage_begin + slot;
           bool contributes = tile_overlaps_head && pos >= head_begin && pos < head_end;
@@ -1859,7 +1872,8 @@ __device__ void phase_complete_attention_group_direct_z2(
           }
         }
       } else if (misspack_z2) {
-        for (int j = local_miss_part; j < kGroup; j += lanes_per_miss_head) {
+        for (int j = local_miss_part; j < kGroup;
+             j += lanes_per_miss_head) {
           int slot = tz * kGroup + j;
           int pos = stage_begin + slot;
           bool contributes =
@@ -2137,7 +2151,6 @@ __device__ void phase_tail_attention_group_direct_z2(
     int encoded_task = task_go[task];
     if (encoded_task < 0 || encoded_task >= group_total) continue;
     int64_t go = static_cast<int64_t>(encoded_task);
-    if (group_mode[go] != kGroupModeFullFallback) continue;
     int tile = task_tile[task];
     int tiles = group_tiles[go];
     if (tile >= tiles) continue;
@@ -4440,21 +4453,21 @@ void mac_persistent_decode_bf16(
   p.long_rect_min_tokens = env_int("MAC_PERSISTENT_LONG_RECT_MIN_TOKENS", 4096);
   p.full_fallback_min_chunk_tokens =
       env_int("MAC_PERSISTENT_FULL_FALLBACK_MIN_CHUNK_TOKENS", 256);
-  p.full_fallback_target_ctas = env_int("MAC_PERSISTENT_FULL_FALLBACK_TARGET_CTAS", 896);
+  p.full_fallback_target_ctas = env_int("MAC_PERSISTENT_FULL_FALLBACK_TARGET_CTAS", 512);
   p.full_fallback_dense_target_ctas =
-      env_int("MAC_PERSISTENT_FULL_FALLBACK_DENSE_TARGET_CTAS", 1120);
+      env_int("MAC_PERSISTENT_FULL_FALLBACK_DENSE_TARGET_CTAS", 512);
   p.full_fallback_per_mode_tiles =
       env_flag("MAC_PERSISTENT_FULL_FALLBACK_PER_MODE_TILES", 1);
   p.full_fallback_producer_coarsen =
-      env_int("MAC_PERSISTENT_FULL_FALLBACK_PRODUCER_COARSEN", 2);
+      env_int("MAC_PERSISTENT_FULL_FALLBACK_PRODUCER_COARSEN", 1);
   if (p.full_fallback_producer_coarsen < 1) p.full_fallback_producer_coarsen = 1;
   if (p.full_fallback_producer_coarsen > 8) p.full_fallback_producer_coarsen = 8;
   p.mixed_fallback_heavy_target_ctas =
       env_int("MAC_PERSISTENT_MIXED_FALLBACK_HEAVY_TARGET_CTAS", 416);
   p.mixed_head_direct_target_ctas =
-      env_int("MAC_PERSISTENT_MIXED_HEAD_DIRECT_TARGET_CTAS", 4096);
+      env_int("MAC_PERSISTENT_MIXED_HEAD_DIRECT_TARGET_CTAS", 2048);
   p.mixed_head_broad_target_ctas =
-      env_int("MAC_PERSISTENT_MIXED_HEAD_BROAD_TARGET_CTAS", 4096);
+      env_int("MAC_PERSISTENT_MIXED_HEAD_BROAD_TARGET_CTAS", 2048);
   p.mixed_head_dense_full_target_ctas =
       env_int("MAC_PERSISTENT_MIXED_HEAD_DENSE_FULL_TARGET_CTAS", 6144);
   p.full_fallback_partial_reduce_chunk =
@@ -4513,11 +4526,10 @@ void mac_persistent_decode_bf16(
   if (block_threads < group_size * 32) block_threads = group_size * 32;
   if (block_threads != 128 && block_threads != 256) block_threads = group_size > 4 ? 256 : 128;
   TORCH_CHECK(block_threads >= D, "persistent decode v1 merge requires at least one thread per head dim");
-  int coop_dynamic_smem =
-      (p.full_fallback_group_direct != 0 && p.group_size == 4 && p.D == kHeadDim &&
-       block_threads == 128)
-          ? kDirectZ2SmemBytes
-          : 0;
+  bool needs_direct_z2_smem =
+      p.group_size == 4 && p.D == kHeadDim && block_threads == 128 &&
+      (p.full_fallback_group_direct != 0 || p.tail_group_direct_z2 != 0);
+  int coop_dynamic_smem = needs_direct_z2_smem ? kDirectZ2SmemBytes : 0;
   if (coop_dynamic_smem > 0) {
     C10_CUDA_CHECK(cudaFuncSetAttribute(
         mac_persistent_decode_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,

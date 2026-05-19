@@ -5,11 +5,11 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/env_mac_portable.sh"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-OUT_DIR="${OUT_DIR:-$MAC_RESULTS_ROOT/repro_portable_plugin_full_curve}"
+OUT_DIR="${OUT_DIR:-$MINORTEST_DIR/benchmark/LongBench/repro_portable_plugin_full_curve}"
 mkdir -p "$OUT_DIR"
 
-cd "$MAC_ATTENTION_REPO_ROOT"
-"$PYTHON_BIN" "$MAC_BENCH_ROOT/bench_mac_vs_flashinfer_direct.py" \
+cd "$MINORTEST_DIR"
+"$PYTHON_BIN" benchmark/LongBench/bench_mac_vs_flashinfer_direct.py \
   --contexts "65536,98304,126976" \
   --batch "1" \
   --hit-rates "0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.875,0.9,0.95,0.96875,1.0" \

@@ -46,11 +46,24 @@ def register_plugin() -> None:
             return
         raise
 
-    from .hook_installer import iter_hook_specs
+    from .hook_installer import _resolve_target, is_installed, iter_hook_specs
+
+    # The portable launcher installs hooks directly before SGLang loads its
+    # plugin entry points. In that mode, registering the same hooks with
+    # HookRegistry would wrap hot-path methods twice.
+    if is_installed():
+        return
 
     hook_types = {
         "around": HookType.AROUND,
         "after": HookType.AFTER,
     }
     for spec in iter_hook_specs():
+        if spec.optional:
+            try:
+                parent, attr_name = _resolve_target(spec.target)
+            except Exception:
+                continue
+            if not hasattr(parent, attr_name):
+                continue
         HookRegistry.register(spec.target, spec.hook, hook_types[spec.kind])

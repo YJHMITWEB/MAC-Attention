@@ -1,0 +1,4 @@
+Model	Overall	Easy	Hard	Short	Medium	Long
+mac_latest_all_Llama-3.1-8B-Instruct_prefill0_chunk8192_thresh0.45_lookbackWithSink512_0_gen2048_semAhead256_20260517_105321	29.6	30.2	29.3	33.9	26.0	29.6
+mac_latest_all_Llama-3.1-8B-Instruct_prefill0_chunk8192_thresh0.45_lookbackWithSink512_0_gen2048_semAhead256_20260518_191508	30.4	31.2	29.9	34.4	27.4	29.6
+reference_optKernel_all_Llama-3.1-8B-Instruct_prefill0_chunk8192_thresh0.45_lookbackWithSink512_0_gen2048_l2Match1_semAhead256_avgHead0	30.0	31.8	28.9	34.4	26.5	29.6

@@ -1,0 +1,12 @@
+host=gilgamesh
+OUT_ROOT=results/sglang_cudagraph_warp_owned_match_focus_20260519_094950_gilgamesh
+CONTEXTS=65536,73728,98304,126976
+SAMPLES=125,55,469,413
+HITS=0.5,0.6,0.8,0.875,0.96875,1.0
+MAC_WORKSPACE_BASE=/home/users/jyao/ai_general_research/minorTest/mac_att_tuning/results/build_sglang_warp_match_20260519_094950_gilgamesh
+module list: gcc/13.2 cuda/13.0
+CC=/packages/gcc/13.2.0/bin/gcc
+CXX=/packages/gcc/13.2.0/bin/g++
+CUDAHOSTCXX=/packages/gcc/13.2.0/bin/g++
+MAC_CUDAGRAPH_SKIP_FLASHINFER_REPLAY_METADATA=1
+candidate=warp-owned phase1_match_scan

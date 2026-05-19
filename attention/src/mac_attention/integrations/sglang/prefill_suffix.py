@@ -41,7 +41,11 @@ def _cpu_int_list(value: Any, batch_size: int) -> Optional[list[int]]:
 
 
 def build_prefill_suffix_plan(
-    forward_batch: Any, batch_size: int, total_q_len: int
+    forward_batch: Any,
+    batch_size: int,
+    total_q_len: int,
+    *,
+    allow_backend_fallback: bool = True,
 ) -> Optional[PrefillSuffixPlan]:
     """Return the compact prefill suffix cache-update plan.
 
@@ -50,21 +54,27 @@ def build_prefill_suffix_plan(
     skipped this chunk for all requests.
     """
 
-    update_starts = _cpu_int_list(
-        getattr(forward_batch, "mac_prefill_cache_update_starts", None),
-        batch_size,
-    )
+    update_starts_value = getattr(forward_batch, "mac_prefill_cache_update_starts", None)
+    if update_starts_value is None and allow_backend_fallback:
+        update_starts_value = getattr(
+            getattr(forward_batch, "attn_backend", None),
+            "mac_prefill_cache_update_starts_current",
+            None,
+        )
+    update_starts = _cpu_int_list(update_starts_value, batch_size)
     if update_starts is None:
         return None
 
-    prefix_lens = _cpu_int_list(
-        getattr(forward_batch, "extend_prefix_lens_cpu", None),
-        batch_size,
-    )
-    extend_lens = _cpu_int_list(
-        getattr(forward_batch, "extend_seq_lens_cpu", None),
-        batch_size,
-    )
+    prefix_lens_value = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+    extend_lens_value = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    if allow_backend_fallback:
+        backend = getattr(forward_batch, "attn_backend", None)
+        if prefix_lens_value is None:
+            prefix_lens_value = getattr(backend, "mac_extend_prefix_lens_cpu_current", None)
+        if extend_lens_value is None:
+            extend_lens_value = getattr(backend, "mac_extend_seq_lens_cpu_current", None)
+    prefix_lens = _cpu_int_list(prefix_lens_value, batch_size)
+    extend_lens = _cpu_int_list(extend_lens_value, batch_size)
     if prefix_lens is None or extend_lens is None:
         return None
     if (

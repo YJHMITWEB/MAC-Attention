@@ -1,0 +1,213 @@
+[prompt] target=65536 index=125 raw_tokens=65582 used=65536 id=66f950acbb02136c067c5021
+[prompt] target=73728 index=55 raw_tokens=73993 used=73728 id=66f4cd2c821e116aacb316ef
+[prompt] target=98304 index=469 raw_tokens=98608 used=98304 id=66ec31eb821e116aacb1bf28
+[prompt] target=126976 index=413 raw_tokens=129587 used=126976 id=66fa415cbb02136c067c671c
+[server] mac max_running=1 port=23913
+/home/users/jyao/miniconda3/envs/macAttention_latest/bin/python -m mac_attention.integrations.sglang.launch_server --model-path /storage/users/jyao/ai_general_research/minorTest/models/Llama-3.1-8B-Instruct --attention-backend flashinfer --trust-remote-code --mem-fraction-static 0.7 --tp 1 --port 23913 --api-key token-abc123 --skip-server-warmup --disable-chunked-prefix-cache --disable-radix-cache --page-size 1 --max-running-requests 1 --chunked-prefill-size 8192 --decode-log-interval 16 --cuda-graph-bs 1 --piecewise-cuda-graph-tokens 8192 --disable-piecewise-cuda-graph
+[latency] mode=mac c=1 context=65536 index=125
+  wall=9.715s agg=13.18 tok/s steady_log=68.76 tok/s
+[latency] mode=mac c=1 context=73728 index=55
+  wall=11.581s agg=11.05 tok/s steady_log=68.12 tok/s
+[latency] mode=mac c=1 context=98304 index=469
+  wall=18.002s agg=7.11 tok/s steady_log=66.92 tok/s
+[latency] mode=mac c=1 context=126976 index=413
+  wall=27.610s agg=4.64 tok/s steady_log=65.38 tok/s
+{
+  "timestamp": "20260519_010224",
+  "model": "/storage/users/jyao/ai_general_research/minorTest/models/Llama-3.1-8B-Instruct",
+  "out_dir": "results/sglang_production_cudagraph_full_hitcurve_20260519_002159/mac_hit_0p96875",
+  "max_new_tokens": 128,
+  "ignore_eos": true,
+  "mac_bench": {
+    "mode": "synthetic_head",
+    "hit_rate": 0.96875,
+    "hit_rate_std": 0.0,
+    "skip_ratio": -1.0,
+    "skip_ratio_std": 0.0,
+    "match_lag_mean": 64.0,
+    "match_lag_std": 0.0,
+    "seed": 1
+  },
+  "prompts": [
+    {
+      "target_context_len": 65536,
+      "used_context_len": 65536,
+      "raw_prompt_tokens": 65582,
+      "sample_index": 125,
+      "_id": "66f950acbb02136c067c5021",
+      "length": "medium",
+      "domain": "Single-Document QA"
+    },
+    {
+      "target_context_len": 73728,
+      "used_context_len": 73728,
+      "raw_prompt_tokens": 73993,
+      "sample_index": 55,
+      "_id": "66f4cd2c821e116aacb316ef",
+      "length": "medium",
+      "domain": "Single-Document QA"
+    },
+    {
+      "target_context_len": 98304,
+      "used_context_len": 98304,
+      "raw_prompt_tokens": 98608,
+      "sample_index": 469,
+      "_id": "66ec31eb821e116aacb1bf28",
+      "length": "medium",
+      "domain": "Single-Document QA"
+    },
+    {
+      "target_context_len": 126976,
+      "used_context_len": 126976,
+      "raw_prompt_tokens": 129587,
+      "sample_index": 413,
+      "_id": "66fa415cbb02136c067c671c",
+      "length": "medium",
+      "domain": "Multi-Document QA"
+    }
+  ],
+  "latency": [
+    {
+      "target_context_len": 65536,
+      "used_context_len": 65536,
+      "raw_prompt_tokens": 65582,
+      "sample_index": 125,
+      "_id": "66f950acbb02136c067c5021",
+      "length": "medium",
+      "domain": "Single-Document QA",
+      "concurrency": 1,
+      "batch_wall_s": 9.715262985031586,
+      "mean_request_latency_s": 9.714389347995166,
+      "max_request_latency_s": 9.714389347995166,
+      "total_completion_tokens": 128,
+      "aggregate_decode_tokens_per_s": 13.175145150183894,
+      "statuses": [
+        200
+      ],
+      "error_count": 0,
+      "errors": [],
+      "decode_log_rates_tokens_per_s": [
+        0.68,
+        68.63,
+        68.73,
+        68.78,
+        68.81,
+        68.81,
+        68.81
+      ],
+      "decode_log_interval_count": 7,
+      "decode_log_steady_mean_tokens_per_s": 68.76166666666667,
+      "decode_log_steady_min_tokens_per_s": 68.63,
+      "decode_log_steady_max_tokens_per_s": 68.81,
+      "mode": "mac",
+      "server_log": "results/sglang_production_cudagraph_full_hitcurve_20260519_002159/mac_hit_0p96875/mac_c1.server.log"
+    },
+    {
+      "target_context_len": 73728,
+      "used_context_len": 73728,
+      "raw_prompt_tokens": 73993,
+      "sample_index": 55,
+      "_id": "66f4cd2c821e116aacb316ef",
+      "length": "medium",
+      "domain": "Single-Document QA",
+      "concurrency": 1,
+      "batch_wall_s": 11.580989518028218,
+      "mean_request_latency_s": 11.580276701017283,
+      "max_request_latency_s": 11.580276701017283,
+      "total_completion_tokens": 128,
+      "aggregate_decode_tokens_per_s": 11.052596136171385,
+      "statuses": [
+        200
+      ],
+      "error_count": 0,
+      "errors": [],
+      "decode_log_rates_tokens_per_s": [
+        1.58,
+        67.9,
+        68.14,
+        68.19,
+        68.19,
+        68.16,
+        68.16
+      ],
+      "decode_log_interval_count": 7,
+      "decode_log_steady_mean_tokens_per_s": 68.12333333333333,
+      "decode_log_steady_min_tokens_per_s": 67.9,
+      "decode_log_steady_max_tokens_per_s": 68.19,
+      "mode": "mac",
+      "server_log": "results/sglang_production_cudagraph_full_hitcurve_20260519_002159/mac_hit_0p96875/mac_c1.server.log"
+    },
+    {
+      "target_context_len": 98304,
+      "used_context_len": 98304,
+      "raw_prompt_tokens": 98608,
+      "sample_index": 469,
+      "_id": "66ec31eb821e116aacb1bf28",
+      "length": "medium",
+      "domain": "Single-Document QA",
+      "concurrency": 1,
+      "batch_wall_s": 18.001606834994163,
+      "mean_request_latency_s": 18.00085193797713,
+      "max_request_latency_s": 18.00085193797713,
+      "total_completion_tokens": 128,
+      "aggregate_decode_tokens_per_s": 7.1104763687636385,
+      "statuses": [
+        200
+      ],
+      "error_count": 0,
+      "errors": [],
+      "decode_log_rates_tokens_per_s": [
+        0.97,
+        66.72,
+        66.9,
+        66.96,
+        66.96,
+        66.99,
+        67.0
+      ],
+      "decode_log_interval_count": 7,
+      "decode_log_steady_mean_tokens_per_s": 66.92166666666667,
+      "decode_log_steady_min_tokens_per_s": 66.72,
+      "decode_log_steady_max_tokens_per_s": 67.0,
+      "mode": "mac",
+      "server_log": "results/sglang_production_cudagraph_full_hitcurve_20260519_002159/mac_hit_0p96875/mac_c1.server.log"
+    },
+    {
+      "target_context_len": 126976,
+      "used_context_len": 126976,
+      "raw_prompt_tokens": 129587,
+      "sample_index": 413,
+      "_id": "66fa415cbb02136c067c671c",
+      "length": "medium",
+      "domain": "Multi-Document QA",
+      "concurrency": 1,
+      "batch_wall_s": 27.61011737800436,
+      "mean_request_latency_s": 27.60949951200746,
+      "max_request_latency_s": 27.60949951200746,
+      "total_completion_tokens": 128,
+      "aggregate_decode_tokens_per_s": 4.635981739866538,
+      "statuses": [
+        200
+      ],
+      "error_count": 0,
+      "errors": [],
+      "decode_log_rates_tokens_per_s": [
+        0.61,
+        65.32,
+        65.44,
+        65.37,
+        65.4,
+        65.37,
+        65.35
+      ],
+      "decode_log_interval_count": 7,
+      "decode_log_steady_mean_tokens_per_s": 65.375,
+      "decode_log_steady_min_tokens_per_s": 65.32,
+      "decode_log_steady_max_tokens_per_s": 65.44,
+      "mode": "mac",
+      "server_log": "results/sglang_production_cudagraph_full_hitcurve_20260519_002159/mac_hit_0p96875/mac_c1.server.log"
+    }
+  ],
+  "latency_speedups": []
+}
+Wrote results/sglang_production_cudagraph_full_hitcurve_20260519_002159/mac_hit_0p96875/result.json

@@ -1,0 +1,198 @@
+{
+  "timestamp": "20260519_095009",
+  "model": "/storage/users/jyao/ai_general_research/minorTest/models/Llama-3.1-8B-Instruct",
+  "out_dir": "results/sglang_cudagraph_warp_owned_match_focus_20260519_094950_gilgamesh/baseline",
+  "max_new_tokens": 128,
+  "ignore_eos": true,
+  "mac_bench": {
+    "mode": "off",
+    "hit_rate": 1.0,
+    "hit_rate_std": 0.0,
+    "skip_ratio": -1.0,
+    "skip_ratio_std": 0.0,
+    "match_lag_mean": 64.0,
+    "match_lag_std": 0.0,
+    "seed": 1
+  },
+  "prompts": [
+    {
+      "target_context_len": 65536,
+      "used_context_len": 65536,
+      "raw_prompt_tokens": 65582,
+      "sample_index": 125,
+      "_id": "66f950acbb02136c067c5021",
+      "length": "medium",
+      "domain": "Single-Document QA"
+    },
+    {
+      "target_context_len": 73728,
+      "used_context_len": 73728,
+      "raw_prompt_tokens": 73993,
+      "sample_index": 55,
+      "_id": "66f4cd2c821e116aacb316ef",
+      "length": "medium",
+      "domain": "Single-Document QA"
+    },
+    {
+      "target_context_len": 98304,
+      "used_context_len": 98304,
+      "raw_prompt_tokens": 98608,
+      "sample_index": 469,
+      "_id": "66ec31eb821e116aacb1bf28",
+      "length": "medium",
+      "domain": "Single-Document QA"
+    },
+    {
+      "target_context_len": 126976,
+      "used_context_len": 126976,
+      "raw_prompt_tokens": 129587,
+      "sample_index": 413,
+      "_id": "66fa415cbb02136c067c671c",
+      "length": "medium",
+      "domain": "Multi-Document QA"
+    }
+  ],
+  "latency": [
+    {
+      "target_context_len": 65536,
+      "used_context_len": 65536,
+      "raw_prompt_tokens": 65582,
+      "sample_index": 125,
+      "_id": "66f950acbb02136c067c5021",
+      "length": "medium",
+      "domain": "Single-Document QA",
+      "concurrency": 1,
+      "batch_wall_s": 9.42570335000346,
+      "mean_request_latency_s": 9.424940416996833,
+      "max_request_latency_s": 9.424940416996833,
+      "total_completion_tokens": 128,
+      "aggregate_decode_tokens_per_s": 13.579888444075955,
+      "statuses": [
+        200
+      ],
+      "error_count": 0,
+      "errors": [],
+      "decode_log_rates_tokens_per_s": [
+        0.5,
+        71.7,
+        71.69,
+        71.71,
+        71.68,
+        71.75,
+        71.66
+      ],
+      "decode_log_interval_count": 7,
+      "decode_log_steady_mean_tokens_per_s": 71.69833333333334,
+      "decode_log_steady_min_tokens_per_s": 71.66,
+      "decode_log_steady_max_tokens_per_s": 71.75,
+      "mode": "baseline",
+      "server_log": "results/sglang_cudagraph_warp_owned_match_focus_20260519_094950_gilgamesh/baseline/baseline_c1.server.log"
+    },
+    {
+      "target_context_len": 73728,
+      "used_context_len": 73728,
+      "raw_prompt_tokens": 73993,
+      "sample_index": 55,
+      "_id": "66f4cd2c821e116aacb316ef",
+      "length": "medium",
+      "domain": "Single-Document QA",
+      "concurrency": 1,
+      "batch_wall_s": 11.212198648005142,
+      "mean_request_latency_s": 11.211703412001953,
+      "max_request_latency_s": 11.211703412001953,
+      "total_completion_tokens": 128,
+      "aggregate_decode_tokens_per_s": 11.416137371306169,
+      "statuses": [
+        200
+      ],
+      "error_count": 0,
+      "errors": [],
+      "decode_log_rates_tokens_per_s": [
+        1.63,
+        68.88,
+        68.95,
+        68.92,
+        68.95,
+        68.93,
+        68.94
+      ],
+      "decode_log_interval_count": 7,
+      "decode_log_steady_mean_tokens_per_s": 68.92833333333334,
+      "decode_log_steady_min_tokens_per_s": 68.88,
+      "decode_log_steady_max_tokens_per_s": 68.95,
+      "mode": "baseline",
+      "server_log": "results/sglang_cudagraph_warp_owned_match_focus_20260519_094950_gilgamesh/baseline/baseline_c1.server.log"
+    },
+    {
+      "target_context_len": 98304,
+      "used_context_len": 98304,
+      "raw_prompt_tokens": 98608,
+      "sample_index": 469,
+      "_id": "66ec31eb821e116aacb1bf28",
+      "length": "medium",
+      "domain": "Single-Document QA",
+      "concurrency": 1,
+      "batch_wall_s": 17.57987443699676,
+      "mean_request_latency_s": 17.57940068100288,
+      "max_request_latency_s": 17.57940068100288,
+      "total_completion_tokens": 128,
+      "aggregate_decode_tokens_per_s": 7.281053141689375,
+      "statuses": [
+        200
+      ],
+      "error_count": 0,
+      "errors": [],
+      "decode_log_rates_tokens_per_s": [
+        1.0,
+        61.78,
+        61.7,
+        61.71,
+        61.65,
+        61.64,
+        61.59
+      ],
+      "decode_log_interval_count": 7,
+      "decode_log_steady_mean_tokens_per_s": 61.678333333333335,
+      "decode_log_steady_min_tokens_per_s": 61.59,
+      "decode_log_steady_max_tokens_per_s": 61.78,
+      "mode": "baseline",
+      "server_log": "results/sglang_cudagraph_warp_owned_match_focus_20260519_094950_gilgamesh/baseline/baseline_c1.server.log"
+    },
+    {
+      "target_context_len": 126976,
+      "used_context_len": 126976,
+      "raw_prompt_tokens": 129587,
+      "sample_index": 413,
+      "_id": "66fa415cbb02136c067c671c",
+      "length": "medium",
+      "domain": "Multi-Document QA",
+      "concurrency": 1,
+      "batch_wall_s": 26.806281003009644,
+      "mean_request_latency_s": 26.805779389003874,
+      "max_request_latency_s": 26.805779389003874,
+      "total_completion_tokens": 128,
+      "aggregate_decode_tokens_per_s": 4.775000306294967,
+      "statuses": [
+        200
+      ],
+      "error_count": 0,
+      "errors": [],
+      "decode_log_rates_tokens_per_s": [
+        0.64,
+        54.93,
+        54.94,
+        54.87,
+        54.93,
+        54.92,
+        54.85
+      ],
+      "decode_log_interval_count": 7,
+      "decode_log_steady_mean_tokens_per_s": 54.906666666666666,
+      "decode_log_steady_min_tokens_per_s": 54.85,
+      "decode_log_steady_max_tokens_per_s": 54.94,
+      "mode": "baseline",
+      "server_log": "results/sglang_cudagraph_warp_owned_match_focus_20260519_094950_gilgamesh/baseline/baseline_c1.server.log"
+    }
+  ],
+  "latency_speedups": []
+}
