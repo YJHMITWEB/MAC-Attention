@@ -3,6 +3,10 @@
 This directory contains small, public result bundles for the portable
 MAC-Attention implementation.
 
+The README figures are generated from these CSVs by
+`plot_portable_plugin_results.py` and written to
+`assets/portable_update_20260519/`.
+
 ## `no_cuda_graph_hit_curve`
 
 Standalone MAC-vs-FlashInfer hit-curve comparison with CUDA graph disabled.

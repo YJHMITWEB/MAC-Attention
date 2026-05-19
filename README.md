@@ -4,235 +4,377 @@
 
 📄 **Paper:** [arXiv:2604.00235](https://arxiv.org/abs/2604.00235)
 
-**MAC-Attention** is a high-performance attention mechanism that reduces
-decoding overhead by **reusing attention computation across semantically
-similar tokens**.
+## Update 2026-05-19: Portable SGLang Plugin
 
-This branch contains the portable SGLang plugin implementation:
+This branch adds a portable SGLang plugin path for MAC-Attention. The goal is
+to use an official SGLang checkout with minimal integration work: install this
+package, put SGLang and MAC-Attention on `PYTHONPATH`, configure MAC through
+environment variables, and launch through the wrapper module. SGLang source
+files do not need to be patched.
 
-- a self-contained cooperative MAC persistent decode CUDA kernel,
-- a Python package that installs SGLang hooks without modifying SGLang source,
-- standalone FlashInfer-versus-MAC benchmark drivers,
-- lightweight usage examples for standalone benchmarking and SGLang launch.
-
-Important note on runtime critical path:
-
-- **Match + attention** are on the decode critical path.
-- **Prefill cache update** and **rectification/cache update** are designed to
-  run asynchronously where supported and are not the target bottleneck.
-
-![](assets/workflow.png)
-
-## Portable SGLang Plugin
-
-The plugin is designed for an official SGLang checkout. Users should not patch
-SGLang files. Instead, put this package and SGLang on `PYTHONPATH`, set MAC
-options through environment variables, and launch through the wrapper module.
-
-Install SGLang and MAC-Attention in editable mode:
-
-```bash
-export SGLANG_ROOT=<path-to-official-sglang>
-export MAC_ATTENTION_REPO_ROOT=<path-to-this-repo>
-
-python -m pip install -e "$SGLANG_ROOT/python"
-python -m pip install -e "$MAC_ATTENTION_REPO_ROOT/attention"
-```
-
-Launch SGLang with MAC-Attention enabled:
+CUDA graph support is available as an opt-in path. The default portable launch
+keeps CUDA graph disabled because that path is the best-validated public
+baseline in this update.
 
 ```bash
 export SGLANG_ROOT=<path-to-official-sglang>
 export MAC_ATTENTION_REPO_ROOT=<path-to-this-repo>
 export MODEL_PATH=<path-to-model>
+
+python -m pip install -e "$SGLANG_ROOT/python"
+python -m pip install -e "$MAC_ATTENTION_REPO_ROOT/attention"
 
 export PYTHONPATH="$MAC_ATTENTION_REPO_ROOT/attention/src:$SGLANG_ROOT/python:${PYTHONPATH:-}"
 export MAC_ATTENTION_ENABLE=1
 export MAC_ATTENTION_PORTABLE_PLUGIN=1
 export MAC_ATTENTION_SGLANG_STRICT=1
-
-# Default: CUDA graph disabled. Set to 0 to opt in.
 export MAC_DISABLE_CUDA_GRAPH=1
 
-export MAC_PERSISTENT_PARALLEL_Z2_SCHEDULE=1
-export MAC_PERSISTENT_MIXED_MISSPACK_Z2=1
-export MAC_FUSE_HIT_TAIL_IN_MERGE=0
-export MAC_USE_FUSED_KV_ROPE=1
-export MAC_USE_FUSED_Q_PRESERVE_ROPE=1
-
-python -m mac_attention.integrations.sglang.launch_server \
-  --model-path "$MODEL_PATH" \
-  --attention-backend flashinfer \
-  --trust-remote-code \
-  --disable-cuda-graph \
-  --disable-radix-cache \
-  --page-size 1 \
-  --chunked-prefill-size 8192 \
-  --port 18543
-```
-
-You can also use the convenience wrapper:
-
-```bash
-export MODEL_PATH=<path-to-model>
 portable_plugin_repro/run_sglang_mac_server.sh
 ```
 
-The wrapper installs hooks before delegating to `sglang.launch_server`. All MAC
-runtime parameters are controlled by environment variables.
-
-CUDA graph is disabled by default in the portable plugin. Users can opt in by
-setting `MAC_DISABLE_CUDA_GRAPH=0` and launching SGLang without
-`--disable-cuda-graph`:
+For standalone MAC-vs-FlashInfer curves:
 
 ```bash
-export MAC_DISABLE_CUDA_GRAPH=0
-portable_plugin_repro/run_sglang_mac_server.sh --cuda-graph-max-bs 1
+OUT_DIR=<path-to-output-dir> portable_plugin_repro/run_standalone_full_curve.sh
 ```
 
-To run the official SGLang FlashInfer baseline from the same checkout, unset
-MAC-specific plugin variables and launch SGLang normally:
+The source CSVs are committed under `results/`, and the figures below can be
+regenerated with:
 
 ```bash
-export SGLANG_PLUGINS=__none__
-unset MAC_ATTENTION_ENABLE
-python -m sglang.launch_server \
-  --model-path "$MODEL_PATH" \
-  --attention-backend flashinfer \
-  --trust-remote-code \
-  --disable-cuda-graph \
-  --disable-radix-cache \
-  --page-size 1 \
-  --chunked-prefill-size 8192 \
-  --port 18544
+python -m pip install matplotlib seaborn pandas
+python plot_portable_plugin_results.py
 ```
 
-## Hard Rules
+![Portable MAC hit curve with CUDA graph disabled](assets/portable_update_20260519/no_cuda_graph_hit_curve.png)
 
-- Keep the MAC math identical to the paper: fixed recent-query ring,
-  pre-RoPE squared-L2 matching, threshold/rectification semantics, and no
-  sorting or reranking in the match window.
-- Keep miss and partial-miss work inside the single cooperative MAC decode
-  kernel and device helpers.
-- Do not add host-side all-miss routing, separate production kernels,
-  production FlashInfer calls, or compile-time escape hatches.
-- Do not add an ad hoc all-miss or `hit=0` special case. `hit=0` is the first
-  point on the same MAC-Attention hit-ratio curve.
-- The only allowed ad hoc fast path is all-hit, where no load balancing is
-  needed.
-- The hit curve should transition smoothly. Higher hit ratios must not select
-  structurally more expensive paths.
+![CUDA graph standalone A/B curve](assets/portable_update_20260519/cuda_graph_standalone_ab.png)
 
-## Project Layout
+**MAC-Attention** is a high-performance attention mechanism that reduces decoding overhead by **reusing attention computation across semantically similar tokens**.
+This repository contains the **full reference implementation**, including:
+- MAC “ring match” CUDA extension (`ext/macMatch.cu`)
+- MAC prefill cache-update CUDA extension (`ext/mac_prefill_update_cache.cu`)
+- the `mac_attention` Python package (in `attention/`) which JIT-builds the attention + rectification-cache ops
 
-```text
+Important note on runtime critical path:
+- **Match + attention** are on the decode critical path.
+- **Prefill cache update** and **rectification+cache** are designed to run **asynchronously** (e.g., on a separate CUDA stream) and are **not on the critical path**.
+
+![](assets/workflow.png)
+
+## 🚀 Quick Start
+
+Prereqs:
+- NVIDIA H100 GPUs
+- CUDA 12.8
+- PyTorch with CUDA enabled (`torch.cuda.is_available() == True`)
+
+Install `mac_attention` (editable):
+
+```bash
+python -m pip install -e attention
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+```
+
+Run the end-to-end example (first run will JIT-compile CUDA extensions):
+
+```bash
+python -u e2e_mac_workflow_example.py --steps 1
+```
+
+## 🗂️ Project Layout
+
+```
 MAC-Attention/
-├── attention/
-│   ├── src/mac_attention/
-│   │   └── integrations/sglang/
-│   │       ├── csrc/                         # CUDA kernels
-│   │       ├── bridge.py                     # extension loader
-│   │       ├── config.py                     # env/config mapping
-│   │       ├── hook_installer.py             # in-memory SGLang hooks
-│   │       └── launch_server.py              # portable launch wrapper
-│   ├── tests/                                # correctness and hook tests
-│   └── tools/                                # direct kernel tools
-├── benchmark/
-│   └── bench_mac_vs_flashinfer_direct.py     # standalone kernel curve
-├── portable_plugin_repro/                    # public reproduction wrappers
-├── results/                                  # curated standalone results
-├── assets/                                   # paper/public README assets
-└── pyproject.toml
+├── README.md
+├── attention/                                   # Python package: mac_attention
+│   ├── pyproject.toml
+│   ├── examples/
+│   │   └── bench_time_grid_min.py               # Minimal benchmark for MACDecode
+│   ├── tests/                                   
+│   └── src/mac_attention/
+│       ├── attention/
+│       │   ├── mac_decode.py                    
+│       │   └── mac_rectification_cache.py       
+│       ├── _jit/                                
+│       └── _vendor/                             # Vendored CUDA/C++ (flashinfer-based)
+├── ext/
+│   ├── macMatch.cu                              # Standalone ring match (+ scheduler)
+│   └── mac_prefill_update_cache.cu              # Standalone prefill cache update
+├── bench_mac_match.py                           # Match benchmark (baseline vs macMatch)
+├── bench_mac_kernel_latency_2x2.py             # Figure-style kernel-latency benchmark
+├── bench_mac_prefill_update_cache.py            # Prefill cache update benchmark
+├── bench_time_grid_mac_attention_speedup.py     # Paper-style sweep: MAC attention vs FlashInfer
+├── bench_time_grid_mac_match_plan_attention.py  # Time grid: plan + attention
+├── bench_time_grid_mac_rectification_cache.py   # Time grid: plan + rectification+cache
+├── e2e_mac_workflow_example.py                  # End-to-end workflow example
+├── plot_attn_speedup.py                         # Shared-axis speedup figure from benchmark CSV
+├── plot_mac_kernel_latency_2x2.py              # Paper-style 2x2 kernel-latency figure
+└── results/                                     # Generated CSVs (created on first run)
 ```
 
-## Standalone Benchmark Example
+## 🛠️ Build / JIT Compilation
 
-Run a standalone FlashInfer-versus-MAC synthetic head curve. Write generated
-outputs outside the repository tree, or override `OUT_DIR` when using the
-wrapper script.
+This repo uses `torch.utils.cpp_extension` and builds CUDA extensions on-demand.
+
+### 1) Standalone extensions (`ext/`)
+
+Built via `torch.utils.cpp_extension.load(...)` when you run:
+- `bench_mac_match.py` (builds `ext/macMatch.cu`, and optionally a baseline `.cu`)
+- `bench_mac_kernel_latency_2x2.py` (builds `ext/macMatch.cu`)
+- `bench_mac_prefill_update_cache.py` (builds `ext/mac_prefill_update_cache.cu`)
+- `bench_time_grid_mac_attention_speedup.py` (builds `ext/macMatch.cu`)
+- `bench_time_grid_mac_match_plan_attention.py` (builds `ext/macMatch.cu`)
+- `e2e_mac_workflow_example.py` (builds `ext/macMatch.cu`)
+
+Build directory:
+```text
+${MAC_WORKSPACE_BASE:-$HOME}/.cache/mac/torch_extensions
+```
+
+### 2) `mac_attention` package CUDA ops (`attention/`)
+
+Built when calling `.plan(...)` on:
+- `mac_attention.MACDecodeWithPagedKVCacheWrapper`
+- `mac_attention.MACRectificationCacheWithPagedKVCacheWrapper`
+
+This happens in:
+- `bench_mac_kernel_latency_2x2.py`
+- `bench_time_grid_mac_attention_speedup.py`
+- `bench_time_grid_mac_match_plan_attention.py`
+- `bench_time_grid_mac_rectification_cache.py`
+- `e2e_mac_workflow_example.py`
+
+Cache root:
+```text
+${MAC_WORKSPACE_BASE:-$HOME}/.cache/mac
+```
+
+Useful knobs:
+```bash
+export MAC_WORKSPACE_BASE=$HOME                           # where to put build artifacts
+export MAC_JIT_VERBOSE=1                                  
+```
+
+Force a clean rebuild:
+```bash
+rm -rf ${MAC_WORKSPACE_BASE:-$HOME}/.cache/mac
+```
+
+## 🧪 Sanity Check
 
 ```bash
-export MAC_ATTENTION_REPO_ROOT=<path-to-this-repo>
-export CUDA_VISIBLE_DEVICES=0
-export MAC_RESULTS_DIR=<path-outside-this-repo>/mac_attention_results
-mkdir -p "$MAC_RESULTS_DIR"
-
-export MAC_PERSISTENT_PARALLEL_Z2_SCHEDULE=1
-export MAC_PERSISTENT_MIXED_MISSPACK_Z2=1
-export MAC_FUSE_HIT_TAIL_IN_MERGE=0
-export MAC_USE_FUSED_KV_ROPE=1
-export MAC_USE_FUSED_Q_PRESERVE_ROPE=1
-
-python "$MAC_ATTENTION_REPO_ROOT/benchmark/bench_mac_vs_flashinfer_direct.py" \
-  --contexts "65536,73728,98304,126976" \
-  --batch "1" \
-  --hit-rates "0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.875,0.9,0.95,0.96875,1.0" \
-  --bench-mode synthetic_head \
-  --warmup 12 \
-  --iters 60 \
-  --partial-fp32 \
-  --flashinfer-baseline-timing plan_run_wall \
-  --csv "$MAC_RESULTS_DIR/standalone_hit_curve.csv"
+export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+python -m pytest -q attention/tests
 ```
 
-Equivalent wrapper:
+## 📊 Benchmarks
+
+All scripts write CSVs to `results/` (created automatically).
+
+### 1) Match benchmark (baseline vs macMatch)
+
+Script: `bench_mac_match.py`
+
+What it measures (all in microseconds):
+- schedule time (`*_schedule_us`)
+- kernel time (`*_kernel_us`)
+- total (`*_us = schedule_us + kernel_us`)
+- correctness vs baseline:
+  - exact output equality (`output_correctness`)
+  - winner-distance sanity check (`l2_correctness`)
+
+Default sweep:
+- `R=64`
+- `M ∈ {256,512,1024,2048}`
+- `H ∈ {8,32}`
+- `D=128`
+- `N ∈ {1,2,4,8,16,32}`
+
+Run:
+```bash
+python -u bench_mac_match.py
+```
+
+Output:
+- `results/bench_mac_match_results.csv`
+
+Notes:
+- `--baseline` is optional and disabled by default.
+
+### 2) Prefill cache update benchmark
+
+Script: `bench_mac_prefill_update_cache.py`
+
+Measures:
+- prefill cache update time (`avg_us`)
+
+Note: In the full system this is typically launched **asynchronously** and overlapped; its latency is **not** on the decode critical path.
+
+Run:
+```bash
+python -u bench_mac_prefill_update_cache.py
+```
+
+Output:
+- `results/bench_mac_prefill_update_cache_results.csv`
+
+### 3) Paper-style 2x2 kernel-latency benchmark
+
+Script: `bench_mac_kernel_latency_2x2.py`
+
+Measures:
+- panel **(a)**: `macMatch` kernel latency vs `flashinfer` decode-kernel latency
+- panel **(b)**: load-balance planner study using **attention-kernel latency only** (`MAC Perfect`, `MAC w.LB`, `MAC w.o. LB`)
+- panels **(c)** and **(d)**: MAC breakdown (`Match`, `Plan`, `Attention`) vs full-attention baseline
+
+Default setup:
+- panel **(a)**:
+  - lengths: `512, 1024, 2048`
+  - GQA configs: `8-2`, `32-8`, `40-10`
+  - batch size: `1`
+- panel **(b)**:
+  - context lengths: `32K, 64K, 128K`
+  - `sigma ∈ {0.1, 0.2, 0.3}`
+  - GQA config: `32-8`
+  - batch size: `1`
+  - `MAC Perfect`: uniform KV access ratio `sigma`
+  - `MAC w.LB`: per-head KV access ratio sampled from `Normal(mean=sigma, std=sigma)` and clamped to `[0,1]`
+  - `MAC w.o. LB`: worst-case uniform KV access ratio `min(1, sigma + sigma)`
+  - the plotted bars use `*_attn_us` only; planner latency is still emitted in the CSV for reference
+- panels **(c)** and **(d)**:
+  - contexts: `32K, 64K, 128K`
+  - skip ratios: `0.99, 0.90, 0.80`
+  - GQA configs: `32-8`, `64-8`
+  - batch size: `4`
+
+Run:
+```bash
+python -u bench_mac_kernel_latency_2x2.py
+```
+
+Outputs:
+- `results/bench_mac_kernel_latency_panel_a.csv`
+- `results/bench_mac_kernel_latency_panel_b.csv`
+- `results/bench_mac_kernel_latency_breakdown.csv`
+
+Plot:
+```bash
+python -u plot_mac_kernel_latency_2x2.py
+```
+
+Figure:
+- `results/mac_kernel_latency_2x2.pdf`
+- `results/mac_kernel_latency_2x2.png`
+
+### 4) Time grid: plan + attention
+
+Script: `bench_time_grid_mac_match_plan_attention.py`
+
+Measures:
+- `MACDecodeWithPagedKVCacheWrapper.plan(...)` time (`standalone_plan_time_us`)
+- attention time (`standalone_attn_time_us`)
+
+Run:
+```bash
+python -u bench_time_grid_mac_match_plan_attention.py
+```
+
+Output:
+- `results/bench_time_grid_mac_match_plan_attention_results.csv`
+
+### 5) Paper-style attention speedup benchmark
+
+Script: `bench_time_grid_mac_attention_speedup.py`
+
+Measures:
+- `mac_match_schedule_us`
+- `mac_match_kernel_us`
+- `mac_match_us`
+- `mac_plan_time_us`
+- `mac_attn_time_us`
+- `mac_total_time_us`
+- `flashinfer_baseline_time_us`
+
+Output schema:
+- `batch_size`
+- `context_length`
+- `KV_Access`
+- `mac_match_rows_per_stage`
+- `mac_match_load_warps`
+- `mac_match_schedule_us`
+- `mac_match_kernel_us`
+- `mac_match_us`
+- `mac_plan_time_us`
+- `mac_attn_time_us`
+- `mac_total_time_us`
+- `flashinfer_baseline_time_us`
+
+Notes:
+- This benchmark requires the `flashinfer` Python package for the baseline path.
+- It uses the same sweep shape as the paper benchmark: `batch_size in {1,2,4,8,16,32,64}`, `context_length in {32768,65536,131072,262144}`, `KV_Access in {0.01,0.05,0.1,0.2,0.3,0.4}`.
+- The plot uses `mac_total_time_us` as the end-to-end MAC critical-path latency.
+- `mac_match_schedule_us` is emitted for visibility, but the plotted critical path follows the e2e workflow example and uses match kernel + plan + attention.
+
+Run:
+```bash
+python -u bench_time_grid_mac_attention_speedup.py
+```
+
+Output:
+- `results/bench_time_grid_results.csv`
+
+Plot:
+```bash
+python -u plot_attn_speedup.py
+```
+
+Figure:
+- `results/attn_speedup_row_from_csv_sharedaxes.pdf`
+
+### 6) Time grid: plan + rectification+cache
+
+Script: `bench_time_grid_mac_rectification_cache.py`
+
+Measures:
+- `MACRectificationCacheWithPagedKVCacheWrapper.plan(...)` time (`standalone_plan_time_us`)
+- rectification+cache time (`standalone_macRectificationCache_time_us`)
+
+Note: Rectification+cache is typically launched **asynchronously** and overlapped; it is **not** on the decode critical path.
+
+Run:
+```bash
+python -u bench_time_grid_mac_rectification_cache.py
+```
+
+Output:
+- `results/bench_time_grid_mac_rectification_cache_results.csv`
+
+### 7) (Optional) Minimal smoke benchmark
 
 ```bash
-OUT_DIR="$MAC_RESULTS_DIR/full_curve" portable_plugin_repro/run_standalone_full_curve.sh
+python -u attention/examples/bench_time_grid_min.py
 ```
 
-For exact-quota `batch=1,Hq=32` synthetic head curves, do not report
-`hit=0.99`; it rounds to all-hit. Use `hit=0.96875` as the first real
-one-miss-head point.
+## 🔄 End-to-End Workflow Example
 
-## Validation Examples
+Script: `e2e_mac_workflow_example.py`
 
-Run unit tests:
+Order of operations:
+1) **mac match** (`ext/macMatch.cu`)
+   - inputs: `queries`, `query_cache`
+   - outputs: `hit`, `left`, `idx`
+2) **mac attention** (`MACDecodeWithPagedKVCacheWrapper`)
+   - inputs: `queries`, paged KV cache, ring `attn_cache`/`lse_cache`, and `attn_start_pos = left`
+   - outputs: full `(o, lse)`
+3) **macRectificationCache** (`MACRectificationCacheWithPagedKVCacheWrapper`)
+   - inputs: `queries`, paged KV cache, ring caches, and full `(o, lse)`
+   - outputs: windowed `(o, lse)` (and updates ring caches)
+   - uses a fixed `window_left` (does not depend on previous kernels)
+   - typically launched **asynchronously** and overlapped; **not** on the decode critical path
 
+Run:
 ```bash
-python -m pytest \
-  "$MAC_ATTENTION_REPO_ROOT/attention/tests/test_sglang_plugin_config.py" \
-  "$MAC_ATTENTION_REPO_ROOT/attention/tests/test_sglang_q_preserve.py"
+python -u e2e_mac_workflow_example.py --steps 2
 ```
-
-Run CUDA correctness for the persistent decode kernel:
-
-```bash
-python "$MAC_ATTENTION_REPO_ROOT/attention/tools/check_mac_persistent_decode.py"
-```
-
-Public helper wrappers are in `portable_plugin_repro/`:
-
-- `env_mac_portable.sh`: shared environment defaults for the portable plugin.
-- `run_hook_smoke.sh`: verifies that SGLang hooks install from environment
-  configuration.
-- `run_correctness.sh`: runs focused Python correctness tests.
-- `run_standalone_full_curve.sh`: runs the standalone MAC-vs-FlashInfer hit
-  curve.
-- `run_sglang_mac_server.sh`: launches an official SGLang checkout with MAC
-  hooks installed.
-
-## Included Results
-
-Curated reproducibility results are included under `results/`.
-
-- `results/no_cuda_graph_hit_curve/`
-  - standalone no-CUDA-graph hit curve against FlashInfer.
-- `results/cuda_graph_standalone_ab/`
-  - focused standalone CUDA-graph optimization A/B curves.
-
-Standalone no-CUDA-graph full hit curve:
-
-- source: `results/no_cuda_graph_hit_curve/comparison.csv`
-- contexts: `64K`, `72K`, `96K`, `127K`
-- hit ratios: `0`, `0.1`, `0.2`, `0.3`, `0.4`, `0.5`, `0.6`, `0.7`,
-  `0.8`, `0.875`, `0.9`, `0.95`, `0.96875`, `1`
-- FlashInfer timing: plan plus run wall time
-
-## Development Notes
-
-- Keep new scratch benchmark outputs outside this repository or in ignored
-  result folders. Only curated reproducibility bundles should be committed.
-- Keep hooks portable: no SGLang source edits should be required.
-- Keep performance comparisons against FlashInfer plan-inclusive baselines when
-  measuring end-to-end decode latency.
