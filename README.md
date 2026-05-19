@@ -4,6 +4,24 @@
 
 📄 **Paper:** [arXiv:2604.00235](https://arxiv.org/abs/2604.00235)
 
+**MAC-Attention** is a high-performance attention mechanism that reduces
+long-context decoding overhead by **reusing attention computation across
+semantically similar tokens**.
+
+This repository provides:
+- a fused persistent BF16 decode CUDA kernel with in-kernel matching, load
+  scheduling, partial attention, merge, and cache update;
+- a portable SGLang integration that installs hooks at runtime instead of
+  editing SGLang source files;
+- standalone correctness and hit-curve benchmark scripts for comparing the
+  fused MAC-Attention kernel against FlashInfer.
+
+Important note on runtime critical path:
+- **Match + attention + merge** are on the decode critical path.
+- **Cache update** is fused into the current decode path for SGLang serving.
+
+![](assets/workflow.png)
+
 ## Update 2026-05-19: Portable SGLang Plugin
 
 MAC-Attention includes a portable SGLang plugin path. The goal is to use an
@@ -49,17 +67,6 @@ python plot_portable_plugin_results.py
 ```
 
 ![Fused MAC-Attention CUDA kernel hit curve](assets/portable_update_20260519/no_cuda_graph_hit_curve.png)
-
-**MAC-Attention** reduces long-context decode attention work by reusing cached
-attention states for semantically similar tokens. The current implementation
-packages:
-
-- a fused persistent BF16 decode CUDA kernel with in-kernel matching, load
-  scheduling, partial attention, merge, and cache update;
-- a portable SGLang integration that installs hooks at runtime instead of
-  editing SGLang source files;
-- standalone correctness and hit-curve benchmark scripts for comparing the
-  fused MAC-Attention kernel against FlashInfer.
 
 ## 🚀 Quick Start
 
