@@ -9,10 +9,13 @@ The README figures are generated from these CSVs by
 
 ## `no_cuda_graph_hit_curve`
 
-Standalone MAC-vs-FlashInfer hit-curve comparison with CUDA graph disabled.
+Standalone fused MAC-Attention CUDA-kernel hit-curve comparison with CUDA graph
+disabled.
 
 - Primary file: `comparison.csv`
 - Context lengths: `64K`, `72K`, `96K`, `127K`
 - Hit ratios: `0`, `0.1`, `0.2`, `0.3`, `0.4`, `0.5`, `0.6`, `0.7`,
   `0.8`, `0.875`, `0.9`, `0.95`, `0.96875`, `1.0`
 - FlashInfer timing includes plan plus run wall time.
+- The README figure highlights the high-hit region (`95-99%+`), which is the
+  common operating regime we observed in practical long-context datasets.

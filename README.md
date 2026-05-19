@@ -12,8 +12,11 @@ package, put SGLang and MAC-Attention on `PYTHONPATH`, configure MAC through
 environment variables, and launch through the wrapper module. SGLang source
 files do not need to be patched.
 
-The public result shown below uses CUDA graph disabled, which is the
-best-validated portable baseline in this update.
+The public result shown below focuses on the fused MAC-Attention CUDA decode
+kernel with CUDA graph disabled. In practical long-context workloads, including
+LongBench-style evaluations we have used internally, the hit ratio is usually
+above 95-99%; the figure highlights that high-hit region because it is where
+users typically experience MAC-Attention on real datasets.
 
 ```bash
 export SGLANG_ROOT=<path-to-official-sglang>
@@ -46,7 +49,7 @@ python -m pip install matplotlib seaborn pandas
 python plot_portable_plugin_results.py
 ```
 
-![Portable MAC hit curve with CUDA graph disabled](assets/portable_update_20260519/no_cuda_graph_hit_curve.png)
+![Fused MAC-Attention CUDA kernel hit curve](assets/portable_update_20260519/no_cuda_graph_hit_curve.png)
 
 **MAC-Attention** is a high-performance attention mechanism that reduces decoding overhead by **reusing attention computation across semantically similar tokens**.
 This repository contains the **full reference implementation**, including:

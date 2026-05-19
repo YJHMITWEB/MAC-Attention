@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate public README figures for portable MAC-Attention results."""
+"""Generate public README figures for MAC-Attention fused-kernel results."""
 
 from __future__ import annotations
 
@@ -77,9 +77,22 @@ def plot_no_cuda_graph_hit_curve() -> None:
         ax=ax,
     )
 
+    ax.axvspan(0.95, 1.0, color="#10A37F", alpha=0.09, linewidth=0)
+    ax.axvline(0.95, color="#10A37F", linestyle=(0, (2, 4)), linewidth=1.4, alpha=0.85)
     ax.axhline(1.0, color="#6B7280", linestyle=(0, (4, 4)), linewidth=1.5)
     ax.text(0.012, 1.015, "FlashInfer parity", color="#6B7280", fontsize=11)
-    fig.text(0.11, 0.94, "Portable MAC Hit Curve", fontsize=23, fontweight="bold", color="#111827")
+    ax.annotate(
+        "Common dataset regime\n95-99%+ hits",
+        xy=(0.972, 1.72),
+        xytext=(0.72, 2.55),
+        arrowprops=dict(arrowstyle="->", color="#10A37F", lw=1.8),
+        color="#047857",
+        fontsize=12,
+        ha="left",
+        va="center",
+        bbox=dict(boxstyle="round,pad=0.28", fc="#ECFDF5", ec="#A7F3D0", lw=1.0),
+    )
+    fig.text(0.11, 0.94, "Fused MAC-Attention CUDA Kernel Hit Curve", fontsize=23, fontweight="bold", color="#111827")
     fig.text(
         0.11,
         0.895,
