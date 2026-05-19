@@ -6,7 +6,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
 import pandas as pd
 import seaborn as sns
 
@@ -99,77 +98,9 @@ def plot_no_cuda_graph_hit_curve() -> None:
     save_figure(fig, "no_cuda_graph_hit_curve")
 
 
-def plot_cuda_graph_ab() -> None:
-    candidate = pd.read_csv(RESULTS / "cuda_graph_standalone_ab" / "warp_owned_match.csv")
-    df = candidate.copy()
-    df["context"] = df["context_len"].astype(int).map(context_label)
-    df["hit_rate"] = df["hit_rate"].astype(float)
-    df["speedup"] = df["mac_speedup_vs_flashinfer"].astype(float)
-
-    fig, ax = plt.subplots(figsize=(10.4, 6.1))
-    fig.subplots_adjust(top=0.78, bottom=0.22, left=0.11, right=0.98)
-    sns.lineplot(
-        data=df,
-        x="hit_rate",
-        y="speedup",
-        hue="context",
-        hue_order=["64K", "72K", "96K", "127K"],
-        marker="o",
-        markersize=7,
-        linewidth=2.7,
-        palette=PALETTE[:4],
-        ax=ax,
-        legend=False,
-    )
-    ax.axhline(1.0, color="#6B7280", linestyle=(0, (4, 4)), linewidth=1.5)
-    ax.text(0.012, 1.015, "FlashInfer parity", color="#6B7280", fontsize=11)
-    fig.text(0.11, 0.94, "CUDA-Graph MAC Hit Curve", fontsize=23, fontweight="bold", color="#111827")
-    fig.text(
-        0.11,
-        0.895,
-        "Standalone decode with CUDA graph enabled; speedup shown against FlashInfer.",
-        color="#4B5563",
-        fontsize=12,
-    )
-    ax.set_xlabel("Hit ratio")
-    ax.set_ylabel("Speedup vs FlashInfer")
-    ax.set_xlim(-0.02, 1.02)
-    ax.set_ylim(0.75, max(df["speedup"].max() + 0.2, 1.6))
-    ax.set_xticks([0, 0.2, 0.4, 0.6, 0.8, 1.0])
-    ax.set_xticklabels(["0", "0.2", "0.4", "0.6", "0.8", "1.0"])
-
-    method_handles = [
-        Line2D([0], [0], color="#6B7280", linestyle=(0, (4, 4)), linewidth=2.2, label="FlashInfer"),
-        Line2D([0], [0], color="#10A37F", marker="o", linewidth=2.7, label="MAC-Attention"),
-    ]
-    method_legend = ax.legend(
-        handles=method_handles,
-        title="Method",
-        loc="upper left",
-        fontsize=13,
-        title_fontsize=13,
-        handlelength=2.0,
-    )
-    ax.add_artist(method_legend)
-    context_handles = [
-        Line2D([0], [0], color=color, marker="o", linewidth=2.7, label=label)
-        for color, label in zip(PALETTE[:4], ["64K", "72K", "96K", "127K"])
-    ]
-    ax.legend(
-        handles=context_handles,
-        title="Context",
-        ncols=4,
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.17),
-    )
-    sns.despine(ax=ax, left=False, bottom=False)
-    save_figure(fig, "cuda_graph_standalone_ab")
-
-
 def main() -> None:
     setup_style()
     plot_no_cuda_graph_hit_curve()
-    plot_cuda_graph_ab()
     print(f"Wrote figures to {OUT.relative_to(ROOT)}")
 
 

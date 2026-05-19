@@ -12,9 +12,8 @@ package, put SGLang and MAC-Attention on `PYTHONPATH`, configure MAC through
 environment variables, and launch through the wrapper module. SGLang source
 files do not need to be patched.
 
-CUDA graph support is available as an opt-in path. The default portable launch
-keeps CUDA graph disabled because that path is the best-validated public
-baseline in this update.
+The public result shown below uses CUDA graph disabled, which is the
+best-validated portable baseline in this update.
 
 ```bash
 export SGLANG_ROOT=<path-to-official-sglang>
@@ -48,15 +47,6 @@ python plot_portable_plugin_results.py
 ```
 
 ![Portable MAC hit curve with CUDA graph disabled](assets/portable_update_20260519/no_cuda_graph_hit_curve.png)
-
-![CUDA graph MAC hit curve](assets/portable_update_20260519/cuda_graph_standalone_ab.png)
-
-Interpretation note: `hit=1.0` is the true all-hit MAC cache-reuse case. In
-that point MAC-Attention avoids the full-KV attention scan, while FlashInfer is
-still the full-attention baseline over the whole context. The large `hit=1.0`
-speedups are therefore expected and should not be read as both kernels doing
-the same full-KV work. The lower-hit and partial-miss points show the mixed
-MAC path where misses still require KV computation.
 
 **MAC-Attention** is a high-performance attention mechanism that reduces decoding overhead by **reusing attention computation across semantically similar tokens**.
 This repository contains the **full reference implementation**, including:

@@ -16,19 +16,3 @@ Standalone MAC-vs-FlashInfer hit-curve comparison with CUDA graph disabled.
 - Hit ratios: `0`, `0.1`, `0.2`, `0.3`, `0.4`, `0.5`, `0.6`, `0.7`,
   `0.8`, `0.875`, `0.9`, `0.95`, `0.96875`, `1.0`
 - FlashInfer timing includes plan plus run wall time.
-
-## `cuda_graph_standalone_ab`
-
-Standalone CUDA-graph hit-curve data from the portable kernel tuning work. In
-the README figure, FlashInfer is plotted as the parity baseline and
-MAC-Attention is plotted per context length relative to that baseline.
-
-- `tail_baseline.csv`: baseline curve from the same tuning session.
-- `warp_owned_match.csv`: MAC-Attention curve used in the README figure.
-
-CUDA graph is supported by the implementation but is not the default. Use
-`MAC_DISABLE_CUDA_GRAPH=0` to opt in when launching SGLang.
-
-Note: `hit=1.0` is the true all-hit MAC cache-reuse case. MAC-Attention avoids
-the full-KV attention scan at that point, while FlashInfer remains the
-full-attention baseline over the whole context.

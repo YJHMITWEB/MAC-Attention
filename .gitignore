@@ -25,5 +25,3 @@ results/*
 !results/README.md
 !results/no_cuda_graph_hit_curve/
 !results/no_cuda_graph_hit_curve/**
-!results/cuda_graph_standalone_ab/
-!results/cuda_graph_standalone_ab/**
