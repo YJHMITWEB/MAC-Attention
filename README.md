@@ -146,7 +146,7 @@ MAC-Attention/
 ├── portable_plugin_repro/
 │   ├── env_mac_portable.sh
 │   ├── run_correctness.sh
-│   ├── run_hook_smoke.sh
+│   ├── run_hook_check.sh
 │   ├── run_sglang_mac_server.sh
 │   └── run_standalone_full_curve.sh
 ├── results/
@@ -190,7 +190,7 @@ rm -rf "$MAC_ATTENTION_REPO_ROOT/attention/.torch_extensions"
 Verify the SGLang hook installation without launching a server:
 
 ```bash
-"$MAC_ATTENTION_REPO_ROOT/portable_plugin_repro/run_hook_smoke.sh"
+"$MAC_ATTENTION_REPO_ROOT/portable_plugin_repro/run_hook_check.sh"
 ```
 
 Run the CUDA kernel and plugin tests:
