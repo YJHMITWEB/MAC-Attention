@@ -6,10 +6,10 @@
 
 ## Update 2026-05-19: Portable SGLang Plugin
 
-This branch adds a portable SGLang plugin path for MAC-Attention. The goal is
-to use an official SGLang checkout with minimal integration work: install this
-package, configure MAC through environment variables, and launch through the
-wrapper module. SGLang source files do not need to be patched.
+MAC-Attention includes a portable SGLang plugin path. The goal is to use an
+official SGLang checkout with minimal integration work: install this package,
+configure MAC through environment variables, and launch through the wrapper
+module. SGLang source files do not need to be patched.
 
 The public result shown below focuses on the fused MAC-Attention CUDA decode
 kernel with CUDA graph disabled. In practical long-context workloads, the hit
@@ -51,8 +51,8 @@ python plot_portable_plugin_results.py
 ![Fused MAC-Attention CUDA kernel hit curve](assets/portable_update_20260519/no_cuda_graph_hit_curve.png)
 
 **MAC-Attention** reduces long-context decode attention work by reusing cached
-attention states for semantically similar tokens. This branch packages the
-current implementation as:
+attention states for semantically similar tokens. The current implementation
+packages:
 
 - a fused persistent BF16 decode CUDA kernel with in-kernel matching, load
   scheduling, partial attention, merge, and cache update;
@@ -208,7 +208,7 @@ PYTHONPATH=attention/src python attention/tools/check_mac_persistent_decode.py
 
 ## 📊 Benchmarks
 
-The public benchmark set in this branch is the no-CUDA-graph fused-kernel hit
+The public benchmark set is the no-CUDA-graph fused-kernel hit
 curve against FlashInfer. It sweeps one request at context lengths 64K, 72K,
 96K, and 127K, and hit ratios from 0 to 1.0:
 
