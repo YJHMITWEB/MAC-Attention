@@ -101,11 +101,12 @@ def plot_no_cuda_graph_hit_curve() -> None:
 def plot_cuda_graph_ab() -> None:
     baseline = pd.read_csv(RESULTS / "cuda_graph_standalone_ab" / "tail_baseline.csv")
     candidate = pd.read_csv(RESULTS / "cuda_graph_standalone_ab" / "warp_owned_match.csv")
-    baseline["variant"] = "tail baseline"
-    candidate["variant"] = "warp-owned match"
+    baseline["variant"] = "FlashInfer"
+    candidate["variant"] = "MAC-Attention"
     df = pd.concat([baseline, candidate], ignore_index=True)
     df["hit_rate"] = df["hit_rate"].astype(float)
     df["speedup"] = df["mac_speedup_vs_flashinfer"].astype(float)
+    df.loc[df["variant"] == "FlashInfer", "speedup"] = 1.0
 
     agg = (
         df.groupby(["variant", "hit_rate"], as_index=False)
@@ -130,11 +131,11 @@ def plot_cuda_graph_ab() -> None:
     )
     ax.axhline(1.0, color="#6B7280", linestyle=(0, (4, 4)), linewidth=1.5)
     ax.text(0.012, 1.015, "FlashInfer parity", color="#6B7280", fontsize=11)
-    fig.text(0.12, 0.94, "CUDA-Graph Standalone A/B", fontsize=23, fontweight="bold", color="#111827")
+    fig.text(0.12, 0.94, "CUDA-Graph Decode Comparison", fontsize=23, fontweight="bold", color="#111827")
     fig.text(
         0.12,
         0.895,
-        "Mean speedup across 64K, 72K, 96K, and 127K contexts.",
+        "Standalone mean speedup across 64K, 72K, 96K, and 127K contexts.",
         color="#4B5563",
         fontsize=12,
     )

@@ -19,12 +19,12 @@ Standalone MAC-vs-FlashInfer hit-curve comparison with CUDA graph disabled.
 
 ## `cuda_graph_standalone_ab`
 
-Standalone CUDA-graph optimization A/B results from the portable kernel tuning
-work.
+Standalone CUDA-graph decode comparison data from the portable kernel tuning
+work. In the README figure, FlashInfer is plotted as the parity baseline and
+MAC-Attention is plotted relative to that baseline.
 
 - `tail_baseline.csv`: baseline curve from the same tuning session.
-- `warp_owned_match.csv`: candidate curve after the warp-owned match-scan
-  change.
+- `warp_owned_match.csv`: MAC-Attention curve used in the README figure.
 
 CUDA graph is supported by the implementation but is not the default. Use
 `MAC_DISABLE_CUDA_GRAPH=0` to opt in when launching SGLang.
