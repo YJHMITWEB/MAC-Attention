@@ -23,5 +23,7 @@ profiles/
 # the curated portable-plugin result bundles referenced by the README.
 results/*
 !results/README.md
-!results/portable_mac_cudagraph_handoff_20260519/
-!results/portable_mac_cudagraph_handoff_20260519/**
+!results/no_cuda_graph_hit_curve/
+!results/no_cuda_graph_hit_curve/**
+!results/cuda_graph_standalone_ab/
+!results/cuda_graph_standalone_ab/**

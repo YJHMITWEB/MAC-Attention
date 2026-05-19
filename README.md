@@ -216,14 +216,14 @@ Public helper wrappers are in `portable_plugin_repro/`:
 
 Curated reproducibility results are included under `results/`.
 
-- `results/portable_mac_cudagraph_handoff_20260519/`
-  - standalone no-CUDA-graph hit curve against FlashInfer;
-  - focused standalone CUDA-graph optimization A/B curves;
-  - command/result manifests for the public standalone artifacts.
+- `results/no_cuda_graph_hit_curve/`
+  - standalone no-CUDA-graph hit curve against FlashInfer.
+- `results/cuda_graph_standalone_ab/`
+  - focused standalone CUDA-graph optimization A/B curves.
 
 Standalone no-CUDA-graph full hit curve:
 
-- source: `results/portable_mac_cudagraph_handoff_20260519/standalone_no_cudagraph_official_vs_best_20260517/comparison_current_vs_previous_best.csv`
+- source: `results/no_cuda_graph_hit_curve/comparison.csv`
 - contexts: `64K`, `72K`, `96K`, `127K`
 - hit ratios: `0`, `0.1`, `0.2`, `0.3`, `0.4`, `0.5`, `0.6`, `0.7`,
   `0.8`, `0.875`, `0.9`, `0.95`, `0.96875`, `1`
