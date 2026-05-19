@@ -49,7 +49,7 @@ python plot_portable_plugin_results.py
 
 ![Portable MAC hit curve with CUDA graph disabled](assets/portable_update_20260519/no_cuda_graph_hit_curve.png)
 
-![CUDA graph decode comparison](assets/portable_update_20260519/cuda_graph_standalone_ab.png)
+![CUDA graph MAC hit curve](assets/portable_update_20260519/cuda_graph_standalone_ab.png)
 
 **MAC-Attention** is a high-performance attention mechanism that reduces decoding overhead by **reusing attention computation across semantically similar tokens**.
 This repository contains the **full reference implementation**, including:

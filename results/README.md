@@ -19,9 +19,9 @@ Standalone MAC-vs-FlashInfer hit-curve comparison with CUDA graph disabled.
 
 ## `cuda_graph_standalone_ab`
 
-Standalone CUDA-graph decode comparison data from the portable kernel tuning
-work. In the README figure, FlashInfer is plotted as the parity baseline and
-MAC-Attention is plotted relative to that baseline.
+Standalone CUDA-graph hit-curve data from the portable kernel tuning work. In
+the README figure, FlashInfer is plotted as the parity baseline and
+MAC-Attention is plotted per context length relative to that baseline.
 
 - `tail_baseline.csv`: baseline curve from the same tuning session.
 - `warp_owned_match.csv`: MAC-Attention curve used in the README figure.
