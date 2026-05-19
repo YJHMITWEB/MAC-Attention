@@ -28,3 +28,7 @@ MAC-Attention is plotted per context length relative to that baseline.
 
 CUDA graph is supported by the implementation but is not the default. Use
 `MAC_DISABLE_CUDA_GRAPH=0` to opt in when launching SGLang.
+
+Note: `hit=1.0` is the true all-hit MAC cache-reuse case. MAC-Attention avoids
+the full-KV attention scan at that point, while FlashInfer remains the
+full-attention baseline over the whole context.
