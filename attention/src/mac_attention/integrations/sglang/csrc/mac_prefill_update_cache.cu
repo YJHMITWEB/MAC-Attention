@@ -73,6 +73,7 @@ __device__ __forceinline__ void copy_bytes_16(void* __restrict__ dst_void,
 
 struct UpdateParams {
   void* q_cache;        // [R,M,H,D] bf16
+  void* q_post_cache;   // [R,M,H,D] bf16 (optional; NaN-sentinel filled)
   void* attn_cache;     // [R,M,H,D] bf16
   void* lse_cache;      // [R,M,H]    f32
   const void* q_src;    // [sumN,H,D] bf16
@@ -103,7 +104,8 @@ static void fill_params(UpdateParams& p,
                         Tensor lens,
                         int capacity,
                         int num_heads,
-                        int head_dim) {
+                        int head_dim,
+                        Tensor q_post_cache) {
   CHECK_CUDA(q_cache);
   CHECK_CONTIG(q_cache);
   CHECK_DTYPE(q_cache, torch::kBFloat16);
@@ -159,6 +161,15 @@ static void fill_params(UpdateParams& p,
               "request_length must be [R] or [B]");
 
   p.q_cache = q_cache.data_ptr();
+  if (q_post_cache.defined() && q_post_cache.numel() > 0) {
+    CHECK_CUDA(q_post_cache);
+    CHECK_CONTIG(q_post_cache);
+    CHECK_DTYPE(q_post_cache, torch::kBFloat16);
+    TORCH_CHECK(q_post_cache.sizes() == q_cache.sizes(), "q_post_cache must match q_cache");
+    p.q_post_cache = q_post_cache.data_ptr();
+  } else {
+    p.q_post_cache = nullptr;
+  }
   p.attn_cache = attn_cache.data_ptr();
   p.lse_cache = lse_cache.data_ptr();
   p.q_src = src_q.data_ptr();
@@ -209,6 +220,8 @@ __global__ void mac_prefill_update_cache_kernel(UpdateParams p) {
   const size_t row_f32 = (size_t)p.H * sizeof(float);
 
   uint8_t* __restrict__ q_cache_r = (uint8_t*)p.q_cache + ((size_t)req * p.M) * row_bf16;
+  uint8_t* __restrict__ q_post_cache_r =
+      p.q_post_cache ? ((uint8_t*)p.q_post_cache + ((size_t)req * p.M) * row_bf16) : nullptr;
   uint8_t* __restrict__ attn_cache_r = (uint8_t*)p.attn_cache + ((size_t)req * p.M) * row_bf16;
   uint8_t* __restrict__ lse_cache_r = (uint8_t*)p.lse_cache + ((size_t)req * p.M) * row_f32;
 
@@ -234,6 +247,20 @@ __global__ void mac_prefill_update_cache_kernel(UpdateParams p) {
     copy_bytes_16(q_cache_r + dst_q, q_src + src_q_off, row_bf16);
     copy_bytes_16(attn_cache_r + dst_a, a_src + src_a_off, row_bf16);
     copy_bytes_16(lse_cache_r + dst_l, l_src + src_l_off, row_f32);
+
+    // Front-sink downdate needs the POST-RoPE matched query, which prefill does
+    // not have here. Write a NaN sentinel so the decode kernel skips front-sink
+    // for slots still owned by prefill (falls back to fixed-band). Decode
+    // overwrites this slot with the real post-RoPE query once it regenerates it.
+    if (q_post_cache_r != nullptr) {
+      __nv_bfloat16* __restrict__ qpc = (__nv_bfloat16*)(q_post_cache_r + dst_q);
+      const int n_elem = p.H * p.D;
+      // bf16 quiet-NaN bit pattern (exp all ones, nonzero mantissa).
+      const __nv_bfloat16 nan_bf16 = __ushort_as_bfloat16((unsigned short)0x7fc0);
+      for (int i = threadIdx.x; i < n_elem; i += blockDim.x) {
+        qpc[i] = nan_bf16;
+      }
+    }
   }
 
   if (!p.request_length_by_batch && blockIdx.x == 0 && threadIdx.x == 0) {
@@ -306,7 +333,8 @@ void mac_prefill_update_cache(Tensor q_cache,
                               Tensor lens,
                               int capacity,
                               int num_heads,
-                              int head_dim) {
+                              int head_dim,
+                              Tensor q_post_cache) {
   if (capacity <= 0 || req_ids.size(0) == 0) return;
 
   UpdateParams p;
@@ -323,7 +351,8 @@ void mac_prefill_update_cache(Tensor q_cache,
               lens,
               capacity,
               num_heads,
-              head_dim);
+              head_dim,
+              q_post_cache);
 
   c10::cuda::CUDAGuard dev_guard(q_cache.device());
   c10::cuda::CUDAStreamGuard stream_guard(at::cuda::getCurrentCUDAStream(q_cache.get_device()));

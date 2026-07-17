@@ -17,6 +17,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--past-len", type=int, default=65535)
     parser.add_argument("--capacity", type=int, default=512)
     parser.add_argument("--semantic-pos-ahead", type=int, default=256)
+    parser.add_argument("--front-sink-tokens", type=int, default=0)
     parser.add_argument("--tile-tokens", type=int, default=32)
     parser.add_argument("--match-tile-slots", type=int, default=32)
     parser.add_argument("--max-context", type=int, default=131072)
@@ -73,6 +74,7 @@ def main() -> None:
         args.tile_tokens,
         args.match_tile_slots,
         args.semantic_pos_ahead,
+        args.front_sink_tokens,
     )
 
     def run_once() -> None:
@@ -95,6 +97,7 @@ def main() -> None:
             args.tile_tokens,
             args.match_tile_slots,
             args.semantic_pos_ahead,
+            args.front_sink_tokens,
             2048,
             0,
             0,
@@ -111,6 +114,10 @@ def main() -> None:
             1,
             -1,
             0,
+            query_cache,
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
         )
 
     for _ in range(args.warmups):

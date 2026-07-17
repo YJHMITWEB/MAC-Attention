@@ -278,7 +278,14 @@ def apply_synthetic_cache_pattern(
 
 
 def bench_flashinfer(
-    case: dict[str, torch.Tensor], *, hq: int, hkv: int, dim: int, warmup: int, iters: int
+    case: dict[str, torch.Tensor],
+    *,
+    hq: int,
+    hkv: int,
+    dim: int,
+    warmup: int,
+    iters: int,
+    use_graph: bool = False,
 ) -> dict[str, float]:
     q = case["q"]
     k = case["k"]
@@ -295,18 +302,24 @@ def bench_flashinfer(
     workspace = torch.empty(128 * 1024 * 1024, device=q.device, dtype=torch.uint8)
     out = torch.empty_like(q)
     lse = torch.empty(batch, hq, device=q.device, dtype=torch.float32)
+    wrapper_kwargs = {"kv_layout": "NHD", "use_cuda_graph": use_graph}
+    if use_graph:
+        # CUDA-graph mode requires persistent plan buffers.
+        wrapper_kwargs.update(
+            paged_kv_indptr_buffer=indptr,
+            paged_kv_indices_buffer=indices,
+            paged_kv_last_page_len_buffer=last_page_len,
+        )
     try:
         wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
             workspace,
-            kv_layout="NHD",
-            use_cuda_graph=False,
             backend="auto",
+            **wrapper_kwargs,
         )
     except TypeError:
         wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
             workspace,
-            kv_layout="NHD",
-            use_cuda_graph=False,
+            **wrapper_kwargs,
         )
     def plan() -> None:
         wrapper.plan(
@@ -329,6 +342,32 @@ def bench_flashinfer(
     for _ in range(warmup):
         launch()
     torch.cuda.synchronize()
+
+    if use_graph:
+        # Plan cost is paid once at capture time; steady-state serving replays
+        # the captured graph, so time graph replay for every reported metric.
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launch()
+        for _ in range(warmup):
+            graph.replay()
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start_wall = time.perf_counter()
+        start.record()
+        for _ in range(iters):
+            graph.replay()
+        end.record()
+        torch.cuda.synchronize()
+        replay_wall_ms = 1000.0 * (time.perf_counter() - start_wall) / max(iters, 1)
+        replay_event_ms = float(start.elapsed_time(end) / max(iters, 1))
+        return {
+            "flashinfer_run_event_ms": replay_event_ms,
+            "flashinfer_plan_run_event_ms": replay_event_ms,
+            "flashinfer_plan_run_wall_ms": replay_wall_ms,
+        }
+
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
@@ -386,6 +425,7 @@ def bench_mac(ext, args: argparse.Namespace, batch: int, kv_len: int, hit_rate: 
         tile_tokens,
         args.match_tile_slots,
         args.semantic_pos_ahead,
+        args.front_sink_tokens,
         torch.float32 if args.partial_fp32 else torch.bfloat16,
     )
     def launch() -> None:
@@ -408,6 +448,7 @@ def bench_mac(ext, args: argparse.Namespace, batch: int, kv_len: int, hit_rate: 
             tile_tokens,
             args.match_tile_slots,
             args.semantic_pos_ahead,
+            args.front_sink_tokens,
             0,
             args.lookback_right,
             0,
@@ -424,17 +465,33 @@ def bench_mac(ext, args: argparse.Namespace, batch: int, kv_len: int, hit_rate: 
             args.bench_seed,
             forced_mask,
             0,
+            case["query_cache"],
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
         )
 
     for _ in range(args.warmup):
         launch()
     torch.cuda.synchronize()
+    if args.cuda_graph:
+        # Steady-state serving replays a captured graph; time replay directly.
+        # The cooperative persistent kernel is graph-capturable.
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launch()
+        for _ in range(args.warmup):
+            graph.replay()
+        torch.cuda.synchronize()
+        launch_once = graph.replay
+    else:
+        launch_once = launch
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start_wall = time.perf_counter()
     start.record()
     for _ in range(args.iters):
-        launch()
+        launch_once()
     end.record()
     torch.cuda.synchronize()
     wall_ms = 1000.0 * (time.perf_counter() - start_wall) / max(args.iters, 1)
@@ -751,6 +808,7 @@ def main() -> None:
     parser.add_argument("--tile-tokens", type=int, default=32)
     parser.add_argument("--capacity", type=int, default=2048)
     parser.add_argument("--semantic-pos-ahead", type=int, default=256)
+    parser.add_argument("--front-sink-tokens", type=int, default=0)
     parser.add_argument("--match-tile-slots", type=int, default=32)
     parser.add_argument("--max-context", type=int, default=131072)
     parser.add_argument("--threshold", type=float, default=0.45)
@@ -771,6 +829,12 @@ def main() -> None:
         ),
     )
     parser.add_argument("--partial-fp32", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--cuda-graph",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Capture both MAC and FlashInfer decode in CUDA graphs and time graph replay.",
+    )
     parser.add_argument(
         "--mac-fast-math",
         action=argparse.BooleanOptionalAction,
@@ -833,6 +897,7 @@ def main() -> None:
                 dim=args.dim,
                 warmup=args.warmup,
                 iters=args.iters,
+                use_graph=args.cuda_graph,
             )
             fi_ms = {
                 "run_event": fi["flashinfer_run_event_ms"],

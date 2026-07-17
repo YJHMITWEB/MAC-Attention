@@ -12,17 +12,24 @@ import seaborn as sns
 
 ROOT = Path(__file__).resolve().parent
 RESULTS = ROOT / "results"
-OUT = ROOT / "assets" / "portable_update_20260519"
+OUT = ROOT / "assets" / "perf_update_20260717"
 
 CONTEXT_LABELS = {
+    32768: "32K",
     65536: "64K",
-    73728: "72K",
     98304: "96K",
     126976: "127K",
     131072: "128K",
 }
 
 PALETTE = ["#111827", "#2563EB", "#10A37F", "#8B5CF6", "#F59E0B"]
+
+SHAPES = [
+    ("gqa8", "GQA-8 (Hq=32, Hkv=4)"),
+    ("gqa4", "GQA-4 (Hq=32, Hkv=8)"),
+]
+BATCHES = [1, 16, 64]
+CONTEXT_ORDER = ["32K", "64K", "96K", "127K"]
 
 
 def context_label(context_len: int) -> str:
@@ -56,64 +63,77 @@ def save_figure(fig: plt.Figure, stem: str) -> None:
     plt.close(fig)
 
 
-def plot_no_cuda_graph_hit_curve() -> None:
-    df = pd.read_csv(RESULTS / "no_cuda_graph_hit_curve" / "comparison.csv")
-    df["context"] = df["context_len"].astype(int).map(context_label)
-    df["speedup"] = df["current_speedup_vs_flashinfer"].astype(float)
-    df["hit_rate"] = df["hit_rate"].astype(float)
+def plot_cuda_graph_hit_curves() -> None:
+    fig, axes = plt.subplots(2, 3, figsize=(19.2, 9.6), sharex=True)
+    fig.subplots_adjust(top=0.85, bottom=0.15, left=0.055, right=0.99, hspace=0.32, wspace=0.18)
 
-    fig, ax = plt.subplots(figsize=(10.4, 6.1))
-    fig.subplots_adjust(top=0.78, bottom=0.22, left=0.11, right=0.98)
-    sns.lineplot(
-        data=df,
-        x="hit_rate",
-        y="speedup",
-        hue="context",
-        hue_order=["64K", "72K", "96K", "127K"],
-        marker="o",
-        markersize=7,
-        linewidth=2.7,
-        palette=PALETTE[:4],
-        ax=ax,
-    )
+    for row, (stem, shape_label) in enumerate(SHAPES):
+        df = pd.read_csv(RESULTS / "cuda_graph_hit_curves" / f"{stem}.csv")
+        df["context"] = df["context_len"].astype(int).map(context_label)
+        df["speedup"] = df["mac_speedup_vs_flashinfer"].astype(float)
+        df["hit_rate"] = df["hit_rate"].astype(float)
 
-    ax.axvspan(0.95, 1.0, color="#10A37F", alpha=0.09, linewidth=0)
-    ax.axvline(0.95, color="#10A37F", linestyle=(0, (2, 4)), linewidth=1.4, alpha=0.85)
-    ax.axhline(1.0, color="#6B7280", linestyle=(0, (4, 4)), linewidth=1.5)
-    ax.text(0.012, 1.015, "FlashInfer parity", color="#6B7280", fontsize=11)
-    ax.annotate(
-        "Common dataset regime\n95-99%+ hits",
-        xy=(0.972, 1.72),
-        xytext=(0.72, 2.55),
-        arrowprops=dict(arrowstyle="->", color="#10A37F", lw=1.8),
-        color="#047857",
-        fontsize=12,
-        ha="left",
-        va="center",
-        bbox=dict(boxstyle="round,pad=0.28", fc="#ECFDF5", ec="#A7F3D0", lw=1.0),
+        for col, batch in enumerate(BATCHES):
+            ax = axes[row][col]
+            sub = df[df["batch"].astype(int) == batch]
+            sns.lineplot(
+                data=sub,
+                x="hit_rate",
+                y="speedup",
+                hue="context",
+                hue_order=CONTEXT_ORDER,
+                marker="o",
+                markersize=6,
+                linewidth=2.4,
+                palette=PALETTE[:4],
+                ax=ax,
+                legend=(row == 0 and col == 0),
+            )
+            ax.axvspan(0.95, 1.0, color="#10A37F", alpha=0.09, linewidth=0)
+            ax.axvline(0.95, color="#10A37F", linestyle=(0, (2, 4)), linewidth=1.2, alpha=0.85)
+            ax.axhline(1.0, color="#6B7280", linestyle=(0, (4, 4)), linewidth=1.4)
+            ax.set_title(f"{shape_label} · batch {batch}", fontsize=15, pad=8)
+            ax.set_xlabel("Hit ratio" if row == 1 else "")
+            ax.set_ylabel("Speedup vs FlashInfer" if col == 0 else "")
+            ax.set_xlim(-0.02, 1.02)
+            ax.set_ylim(min(0.45, sub["speedup"].min() * 0.9), sub["speedup"].max() * 1.12)
+            ax.set_xticks([0, 0.2, 0.4, 0.6, 0.8, 1.0])
+            ax.set_xticklabels(["0", "0.2", "0.4", "0.6", "0.8", "1.0"])
+            sns.despine(ax=ax, left=False, bottom=False)
+
+    axes[0][0].text(0.015, 1.05, "FlashInfer parity", color="#6B7280", fontsize=10.5)
+    handles, labels = axes[0][0].get_legend_handles_labels()
+    axes[0][0].get_legend().remove()
+    fig.legend(
+        handles,
+        labels,
+        title="Context",
+        ncols=5,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.0),
     )
-    fig.text(0.11, 0.94, "Fused MAC-Attention CUDA Kernel Hit Curve", fontsize=23, fontweight="bold", color="#111827")
     fig.text(
-        0.11,
-        0.895,
-        "Standalone decode, CUDA graph disabled; FlashInfer includes plan + run wall time.",
+        0.055,
+        0.955,
+        "Fused MAC-Attention CUDA Kernel Hit Curves",
+        fontsize=23,
+        fontweight="bold",
+        color="#111827",
+    )
+    fig.text(
+        0.055,
+        0.915,
+        "Standalone decode on H100 80GB (HBM3); both kernels timed as CUDA-graph replay\n"
+        "(FlashInfer plan captured once). Shaded region: common dataset regime (95-99%+ hits).",
         color="#4B5563",
         fontsize=12,
     )
-    ax.set_xlabel("Hit ratio")
-    ax.set_ylabel("Speedup vs FlashInfer")
-    ax.set_xlim(-0.02, 1.02)
-    ax.set_ylim(0.75, max(df["speedup"].max() + 0.2, 1.6))
-    ax.set_xticks([0, 0.2, 0.4, 0.6, 0.8, 1.0])
-    ax.set_xticklabels(["0", "0.2", "0.4", "0.6", "0.8", "1.0"])
-    ax.legend(title="Context", ncols=4, loc="upper center", bbox_to_anchor=(0.5, -0.17))
-    sns.despine(ax=ax, left=False, bottom=False)
-    save_figure(fig, "no_cuda_graph_hit_curve")
+    save_figure(fig, "cuda_graph_hit_curves")
 
 
 def main() -> None:
     setup_style()
-    plot_no_cuda_graph_hit_curve()
+    plot_cuda_graph_hit_curves()
     print(f"Wrote figures to {OUT.relative_to(ROOT)}")
 
 

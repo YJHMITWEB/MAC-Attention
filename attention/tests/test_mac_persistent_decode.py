@@ -51,10 +51,23 @@ def _merge(o1, l1, o2, l2):
     return torch.stack(outs), torch.stack(lses)
 
 
-def _workspace(batch, hq, hkv, group, dim, capacity, max_context, tile_tokens, match_tile_slots, semantic_pos_ahead):
+def _workspace(
+    batch,
+    hq,
+    hkv,
+    group,
+    dim,
+    capacity,
+    max_context,
+    tile_tokens,
+    match_tile_slots,
+    semantic_pos_ahead,
+    front_sink_tokens=0,
+):
     max_match_tiles = (capacity + match_tile_slots - 1) // match_tile_slots
     max_tiles_context = (max_context + tile_tokens - 1) // tile_tokens
-    max_tiles_reduce = (max_context + tile_tokens * 32 - 1) // (tile_tokens * 32)
+    max_tiles_context += (max(front_sink_tokens, 0) + tile_tokens - 1) // tile_tokens
+    max_tiles_reduce = (max_tiles_context + 31) // 32
     max_tiles_tail = max(1, (max(semantic_pos_ahead, 1) + tile_tokens - 1) // tile_tokens)
     max_complete_tasks = batch * hq * max_tiles_context
     max_tail_tasks = batch * hkv * max_tiles_tail
@@ -145,6 +158,7 @@ def test_persistent_decode_hit_clean_half_open_cache_row():
         0,
         0,
         0,
+        0,
         0.45,
         sm_scale,
         0,
@@ -158,6 +172,10 @@ def test_persistent_decode_hit_clean_half_open_cache_row():
         1,
         -1,
         0,
+        query_cache,
+        torch.empty(0),
+        torch.empty(0),
+        torch.empty(0),
     )
     torch.cuda.synchronize()
 
@@ -228,6 +246,7 @@ def test_persistent_decode_miss_multi_request():
         0,
         0,
         0,
+        0,
         0.45,
         sm_scale,
         0,
@@ -241,6 +260,10 @@ def test_persistent_decode_miss_multi_request():
         1,
         -1,
         0,
+        query_cache,
+        torch.empty(0),
+        torch.empty(0),
+        torch.empty(0),
     )
     torch.cuda.synchronize()
 
@@ -307,6 +330,7 @@ def test_persistent_decode_short_context_writes_empty_cache_row():
         0,
         0,
         0,
+        0,
         0.45,
         sm_scale,
         0,
@@ -320,6 +344,10 @@ def test_persistent_decode_short_context_writes_empty_cache_row():
         1,
         -1,
         0,
+        query_cache,
+        torch.empty(0),
+        torch.empty(0),
+        torch.empty(0),
     )
     torch.cuda.synchronize()
 
@@ -404,6 +432,7 @@ def test_persistent_decode_tie_breaks_by_logical_position_after_wraparound():
         0,
         0,
         0,
+        0,
         0.45,
         sm_scale,
         0,
@@ -417,6 +446,10 @@ def test_persistent_decode_tie_breaks_by_logical_position_after_wraparound():
         1,
         -1,
         0,
+        query_cache,
+        torch.empty(0),
+        torch.empty(0),
+        torch.empty(0),
     )
     torch.cuda.synchronize()
 

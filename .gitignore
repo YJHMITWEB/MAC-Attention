@@ -23,5 +23,5 @@ profiles/
 # the curated portable-plugin result bundles referenced by the README.
 results/*
 !results/README.md
-!results/no_cuda_graph_hit_curve/
-!results/no_cuda_graph_hit_curve/**
+!results/cuda_graph_hit_curves/
+!results/cuda_graph_hit_curves/**

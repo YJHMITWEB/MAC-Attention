@@ -60,6 +60,9 @@ def iter_hook_specs() -> Iterable[HookSpec]:
         llama_for_causal_lm_forward_around,
         llama_mlp_forward_around,
         llama_model_forward_around,
+        qwen2_moe_attention_forward_around,
+        qwen3_moe_attention_forward_around,
+        qwen_moe_attention_init_after,
     )
     from .plugin import (
         server_args_add_cli_args_around,
@@ -137,6 +140,42 @@ def iter_hook_specs() -> Iterable[HookSpec]:
         "sglang.srt.models.llama:LlamaModel.forward",
         llama_model_forward_around,
         "around",
+    )
+    yield HookSpec(
+        "sglang.srt.models.qwen2_moe:Qwen2MoeAttention.__init__",
+        qwen_moe_attention_init_after,
+        "after",
+        optional=True,
+    )
+    yield HookSpec(
+        "sglang.srt.models.qwen2_moe:Qwen2MoeAttention.forward",
+        qwen2_moe_attention_forward_around,
+        "around",
+        optional=True,
+    )
+    yield HookSpec(
+        "sglang.srt.models.qwen2_moe:Qwen2MoeModel.forward",
+        llama_model_forward_around,
+        "around",
+        optional=True,
+    )
+    yield HookSpec(
+        "sglang.srt.models.qwen3_moe:Qwen3MoeAttention.__init__",
+        qwen_moe_attention_init_after,
+        "after",
+        optional=True,
+    )
+    yield HookSpec(
+        "sglang.srt.models.qwen3_moe:Qwen3MoeAttention.forward",
+        qwen3_moe_attention_forward_around,
+        "around",
+        optional=True,
+    )
+    yield HookSpec(
+        "sglang.srt.models.qwen3_moe:Qwen3MoeModel.forward",
+        llama_model_forward_around,
+        "around",
+        optional=True,
     )
     if _profiling_enabled():
         yield HookSpec(

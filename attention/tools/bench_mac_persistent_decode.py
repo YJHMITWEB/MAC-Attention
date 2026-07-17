@@ -23,11 +23,12 @@ def _workspace(
     tile_tokens: int,
     match_tile_slots: int,
     semantic_pos_ahead: int,
+    front_sink_tokens: int,
     partial_o_dtype: torch.dtype,
 ):
     max_match_tiles = _ceil_div(capacity, match_tile_slots)
-    max_tiles_context = _ceil_div(max_context, tile_tokens)
-    max_tiles_reduce = _ceil_div(max_context, tile_tokens * 32)
+    max_tiles_context = _ceil_div(max_context, tile_tokens) + _ceil_div(max(front_sink_tokens, 0), tile_tokens)
+    max_tiles_reduce = _ceil_div(max_tiles_context, 32)
     max_tiles_tail = max(1, _ceil_div(max(semantic_pos_ahead, 1), tile_tokens))
     max_complete_tasks = batch * hq * max_tiles_context
     max_tail_tasks = batch * hkv * max_tiles_tail
@@ -144,6 +145,7 @@ def _bench_one(ext, args, batch: int, kv_len: int, hit_pattern: str, tile_tokens
         tile_tokens,
         args.match_tile_slots,
         args.semantic_pos_ahead,
+        args.front_sink_tokens,
         torch.float32 if args.partial_fp32 else torch.bfloat16,
     )
     bench_mode = _bench_mode_value(args.bench_mode)
@@ -169,6 +171,7 @@ def _bench_one(ext, args, batch: int, kv_len: int, hit_pattern: str, tile_tokens
             tile_tokens,
             args.match_tile_slots,
             args.semantic_pos_ahead,
+            args.front_sink_tokens,
             gen_min_limit,
             args.lookback_right,
             0,
@@ -185,6 +188,10 @@ def _bench_one(ext, args, batch: int, kv_len: int, hit_pattern: str, tile_tokens
             args.bench_seed,
             -1,
             0,
+            case["query_cache"],
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
         )
 
     for _ in range(args.warmup):
@@ -254,6 +261,7 @@ def main():
     parser.add_argument("--tile-tokens", type=int, nargs="+", default=[64, 128])
     parser.add_argument("--capacity", type=int, default=2048)
     parser.add_argument("--semantic-pos-ahead", type=int, default=256)
+    parser.add_argument("--front-sink-tokens", type=int, default=0)
     parser.add_argument("--match-tile-slots", type=int, default=64)
     parser.add_argument("--max-context", type=int, default=131072)
     parser.add_argument("--threshold", type=float, default=0.45)

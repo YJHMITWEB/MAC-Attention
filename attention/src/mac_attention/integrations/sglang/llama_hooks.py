@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import sys
+import weakref
 from pathlib import Path
 from typing import Any, Optional
 
@@ -33,6 +34,25 @@ def _graph_trace(message: str, layer_idx: int | None = None) -> None:
     }:
         return
     prefix = "[mac-graph-trace]"
+    if layer_idx is not None:
+        prefix += f"[layer={layer_idx}]"
+    print(f"{prefix} {message}", file=sys.stderr, flush=True)
+
+
+def _qwen_trace(message: str, layer_idx: int | None = None) -> None:
+    raw = os.environ.get("MAC_PREFILL_TRACE", "0").strip().lower()
+    if raw not in {"1", "true", "yes", "on"}:
+        return
+    layer_filter = os.environ.get("MAC_PREFILL_TRACE_LAYERS", "").strip()
+    if layer_filter and layer_idx is not None:
+        allowed = {
+            int(part)
+            for part in layer_filter.replace(",", " ").split()
+            if part.strip().lstrip("-").isdigit()
+        }
+        if allowed and int(layer_idx) not in allowed:
+            return
+    prefix = "[MAC_QWEN_TRACE]"
     if layer_idx is not None:
         prefix += f"[layer={layer_idx}]"
     print(f"{prefix} {message}", file=sys.stderr, flush=True)
@@ -281,17 +301,20 @@ def _active_request_capacity(
     # compile we avoid device->host req-id copies, so keep a small reserve even
     # when req_ids_host is unavailable.
     request_pool_pad = max(int(os.environ.get("MAC_REQUEST_POOL_PAD", "8")), 1)
+    active_only = os.environ.get(
+        "MAC_ACTIVE_REQUEST_CAPACITY_ONLY", "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
     capacity = max(
         int(max_running) + request_pool_pad,
         int(batch_size) + request_pool_pad,
         1,
     )
-    if torch.is_tensor(req_to_token) and req_to_token.dim() >= 1:
+    if not active_only and torch.is_tensor(req_to_token) and req_to_token.dim() >= 1:
         # Match SGLang's actual request-pool address space, including its
         # padding row 0 used by CUDA graph capture.
         capacity = max(capacity, int(req_to_token.shape[0]))
     pool_size = getattr(req_to_token_pool, "size", None)
-    if pool_size is not None:
+    if not active_only and pool_size is not None:
         try:
             capacity = max(capacity, int(pool_size))
         except Exception:
@@ -446,12 +469,23 @@ def _prepare_mac_forward_batch_state(
         return
     if _is_torch_compiling() or _is_piecewise_cuda_graph_active():
         return
-    max_running = int(getattr(server_args, "max_running_requests", getattr(forward_batch, "batch_size", 1)))
+    max_running = _max_running_requests(server_args, forward_batch)
     state = getattr(forward_batch, "_mac_forward_batch_state", None)
     if state is None:
         state = MACForwardBatchState()
         setattr(forward_batch, "_mac_forward_batch_state", state)
     state.prepare(forward_batch, device, max_running, config)
+
+
+def _max_running_requests(server_args: Any, forward_batch: Any) -> int:
+    fallback = int(getattr(forward_batch, "batch_size", 1) or 1)
+    raw = getattr(server_args, "max_running_requests", None)
+    if raw is None:
+        return fallback
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return fallback
 
 
 def _prefill_preserve_q_range(forward_batch: Any, q_len: int) -> tuple[int, int, bool]:
@@ -575,8 +609,24 @@ def _preserve_q_before_rope(
     ].contiguous().clone()
 
 
+# Registry of live per-layer metadata objects so backend-level hooks (e.g.
+# the pre-CUDA-graph-replay cache-update wait) can reach every layer's
+# offload event without a layer handle.
+_ALL_MAC_METADATA: "weakref.WeakSet[MACMetadata]" = None  # type: ignore[assignment]
+
+
+def iter_all_mac_metadata():
+    if _ALL_MAC_METADATA is None:
+        return ()
+    return tuple(_ALL_MAC_METADATA)
+
+
 class MACMetadata:
     def __init__(self, num_heads: int, num_kv_heads: int, head_dim: int) -> None:
+        global _ALL_MAC_METADATA
+        if _ALL_MAC_METADATA is None:
+            _ALL_MAC_METADATA = weakref.WeakSet()
+        _ALL_MAC_METADATA.add(self)
         self.num_heads = int(num_heads)
         self.num_kv_heads = int(num_kv_heads)
         self.head_dim = int(head_dim)
@@ -609,6 +659,9 @@ class MACMetadata:
         self.num_k_head = 0
 
         self.unified_query_cache: Optional[torch.Tensor] = None
+        # POST-RoPE mirror of unified_query_cache, used only by the front-sink
+        # downdate. Allocated (and NaN-initialized) only when front sink is enabled.
+        self.unified_query_post_cache: Optional[torch.Tensor] = None
         self.unified_attn_cache: Optional[torch.Tensor] = None
         self.unified_lse_cache: Optional[torch.Tensor] = None
         self.hit: Optional[torch.Tensor] = None
@@ -697,11 +750,14 @@ class MACMetadata:
         if device.type != "cuda":
             return
 
-        max_running = int(
+        raw_max_running = (
             request_capacity
             if request_capacity is not None
-            else getattr(server_args, "max_running_requests", batch_size)
+            else getattr(server_args, "max_running_requests", None)
         )
+        if raw_max_running is None:
+            raw_max_running = batch_size
+        max_running = int(raw_max_running)
         capacity = int(config.mac_lookback_tokens_left)
         self.prefill_preserve_tail_tokens = max(1, capacity)
         prefill_capacity = max(int(max_num_query), int(num_query_token), 1)
@@ -760,6 +816,10 @@ class MACMetadata:
                 device=device,
             )
             self.unified_attn_cache = torch.empty_like(self.unified_query_cache)
+            # Legacy buffer from the removed front-sink downdate design; the
+            # exclusion design needs no post-RoPE query cache. Kept as an empty
+            # tensor for call-signature compatibility.
+            self.unified_query_post_cache = self.unified_query_cache.new_empty((0,))
             self.unified_lse_cache = torch.empty(
                 (max_running, capacity, self.num_heads),
                 dtype=torch.float32,
@@ -1001,6 +1061,229 @@ def llama_attention_init_after(result: Any, self: Any, *args: Any, **kwargs: Any
     return result
 
 
+def qwen_moe_attention_init_after(result: Any, self: Any, *args: Any, **kwargs: Any) -> Any:
+    self.mac_metadata = MACMetadata(self.num_heads, self.num_kv_heads, self.head_dim)
+    self.attn.mac_metadata = self.mac_metadata
+    return result
+
+
+def _qwen_moe_prepare_mac_state(
+    self: Any,
+    hidden_states: torch.Tensor,
+    forward_batch: Any,
+    config: Any,
+) -> tuple[int, MACMetadata]:
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+    except Exception:
+        server_args = None
+
+    layer_idx = int(getattr(getattr(self, "attn", None), "layer_id", 0))
+    metadata: MACMetadata = getattr(self, "mac_metadata", None)
+    if metadata is None:
+        metadata = MACMetadata(self.num_heads, self.num_kv_heads, self.head_dim)
+        self.mac_metadata = metadata
+
+    capacity = int(config.mac_lookback_tokens_left)
+    max_running = _max_running_requests(server_args, forward_batch)
+    request_capacity = _active_request_capacity(forward_batch, max_running)
+    cache_ready = (
+        metadata.unified_query_cache is not None
+        and metadata.unified_query_cache.device == hidden_states.device
+        and metadata.unified_query_cache.dtype == hidden_states.dtype
+        and metadata.unified_query_cache.shape[0] >= request_capacity
+        and metadata.unified_query_cache.shape[1] == capacity
+    )
+    if cache_ready:
+        metadata.device = hidden_states.device
+        metadata.dtype = hidden_states.dtype
+        metadata.layer_idx = layer_idx
+        metadata.cur_q_len = int(hidden_states.shape[0])
+        metadata.batch_size = int(forward_batch.batch_size)
+    else:
+        metadata.init_host_buffer(
+            hidden_states.dtype,
+            hidden_states.device,
+            hidden_states.shape[0],
+            forward_batch.batch_size,
+            getattr(server_args, "chunked_prefill_size", hidden_states.shape[0]),
+            server_args,
+            layer_idx,
+            config,
+            request_capacity,
+        )
+    metadata.prepare_forward_batch(forward_batch, config)
+    return layer_idx, metadata
+
+
+def _qwen_moe_finish_attention(
+    self: Any,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    forward_batch: Any,
+    metadata: MACMetadata,
+    config: Any,
+    fused_kv_arg: Any = None,
+) -> torch.Tensor:
+    layer_idx = int(getattr(getattr(self, "attn", None), "layer_id", 0))
+    current_is_decode = forward_batch.forward_mode.is_decode_or_idle()
+    _qwen_trace(
+        f"finish enter mode={getattr(forward_batch, 'forward_mode', None)} "
+        f"q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}",
+        layer_idx,
+    )
+    fused_q_rope = _try_mac_decode_rope_preserve(
+        self, positions, q, k, v, forward_batch, metadata
+    )
+    _qwen_trace(f"after preserve fused_q_rope={fused_q_rope}", layer_idx)
+    if not fused_q_rope:
+        _preserve_q_before_rope(metadata, q, current_is_decode, forward_batch)
+        if fused_kv_arg is None:
+            _qwen_trace("before rotary", layer_idx)
+            q, k = self.rotary_emb(positions, q, k)
+        else:
+            _qwen_trace("before rotary fused_kv_arg", layer_idx)
+            q, k = self.rotary_emb(
+                positions,
+                q,
+                k,
+                fused_set_kv_buffer_arg=fused_kv_arg,
+            )
+        _qwen_trace("after rotary", layer_idx)
+    metadata.rotary_emb = self.rotary_emb
+
+    if metadata.last_forward_was_decode and not current_is_decode:
+        _log_profile_if_needed(metadata, config, layer_idx)
+        metadata.reset()
+
+    metadata.num_k_head = getattr(self, "num_kv_heads", 0)
+    self.attn.mac_metadata = metadata
+    self.attn.mac_config = config
+    _qwen_trace(
+        f"before radix save_kv={not fused_q_rope and fused_kv_arg is None}",
+        layer_idx,
+    )
+    attn_output = self.attn(
+        q,
+        k,
+        v,
+        forward_batch,
+        save_kv_cache=(not fused_q_rope and fused_kv_arg is None),
+    )
+    _qwen_trace(f"after radix attn_output={tuple(attn_output.shape)}", layer_idx)
+    output, _ = self.o_proj(attn_output)
+    _qwen_trace(f"after o_proj output={tuple(output.shape)}", layer_idx)
+    metadata.last_forward_was_decode = current_is_decode
+    return output
+
+
+def qwen2_moe_attention_forward_around(
+    original_fn: Any, self: Any, *args: Any, **kwargs: Any
+) -> Any:
+    positions = kwargs.get("positions", args[0] if len(args) > 0 else None)
+    hidden_states = kwargs.get("hidden_states", args[1] if len(args) > 1 else None)
+    forward_batch = kwargs.get("forward_batch", args[2] if len(args) > 2 else None)
+    if positions is None or hidden_states is None or forward_batch is None:
+        return original_fn(self, *args, **kwargs)
+
+    config = getattr(forward_batch, "_mac_config", None)
+    if config is None:
+        config = getattr(getattr(self, "attn", None), "mac_config", None)
+    if config is None:
+        config = get_mac_config()
+    if (
+        not config.enable_mac
+        or hidden_states.device.type != "cuda"
+        or hidden_states.shape[0] == 0
+    ):
+        return original_fn(self, *args, **kwargs)
+
+    layer_idx, metadata = _qwen_moe_prepare_mac_state(
+        self, hidden_states, forward_batch, config
+    )
+    _qwen_trace(f"qwen2 forward hidden={tuple(hidden_states.shape)}", layer_idx)
+    qkv, _ = self.qkv_proj(hidden_states)
+    _qwen_trace(f"qwen2 after qkv={tuple(qkv.shape)}", layer_idx)
+    q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+    return _qwen_moe_finish_attention(
+        self, q, k, v, positions, forward_batch, metadata, config
+    )
+
+
+def qwen3_moe_attention_forward_around(
+    original_fn: Any, self: Any, *args: Any, **kwargs: Any
+) -> Any:
+    positions = kwargs.get("positions", args[0] if len(args) > 0 else None)
+    hidden_states = kwargs.get("hidden_states", args[1] if len(args) > 1 else None)
+    forward_batch = kwargs.get("forward_batch", args[2] if len(args) > 2 else None)
+    if positions is None or hidden_states is None or forward_batch is None:
+        return original_fn(self, *args, **kwargs)
+
+    config = getattr(forward_batch, "_mac_config", None)
+    if config is None:
+        config = getattr(getattr(self, "attn", None), "mac_config", None)
+    if config is None:
+        config = get_mac_config()
+    if (
+        not config.enable_mac
+        or hidden_states.device.type != "cuda"
+        or hidden_states.shape[0] == 0
+    ):
+        return original_fn(self, *args, **kwargs)
+
+    layer_idx, metadata = _qwen_moe_prepare_mac_state(
+        self, hidden_states, forward_batch, config
+    )
+    _qwen_trace(f"qwen3 forward hidden={tuple(hidden_states.shape)}", layer_idx)
+    qkv, _ = self.qkv_proj(hidden_states)
+    _qwen_trace(f"qwen3 after qkv={tuple(qkv.shape)}", layer_idx)
+    use_fused = getattr(self, "use_fused_qk_norm_rope", False) and qkv.dtype == torch.bfloat16
+    if use_fused:
+        _qwen_trace("qwen3 fused_qk_norm_rope fallback original", layer_idx)
+        return original_fn(self, *args, **kwargs)
+
+    from sglang.srt.models.utils import apply_qk_norm
+
+    q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+    q, k = apply_qk_norm(
+        q=q,
+        k=k,
+        q_norm=self.q_norm,
+        k_norm=self.k_norm,
+        head_dim=self.head_dim,
+        alt_stream=getattr(self, "alt_stream", None),
+    )
+    _qwen_trace("qwen3 after qk_norm", layer_idx)
+    self._used_fused_qk_norm_rope_last_call = False
+
+    fused_kv_arg = None
+    try:
+        from sglang.srt.models.utils import (
+            create_fused_set_kv_buffer_arg,
+            enable_fused_set_kv_buffer,
+        )
+
+        if (
+            enable_fused_set_kv_buffer(forward_batch)
+            and getattr(self, "compatible_with_fused_kv_buffer", False)
+        ):
+            fused_kv_arg = create_fused_set_kv_buffer_arg(
+                value=v,
+                layer=self.attn,
+                forward_batch=forward_batch,
+            )
+    except Exception:
+        fused_kv_arg = None
+
+    return _qwen_moe_finish_attention(
+        self, q, k, v, positions, forward_batch, metadata, config, fused_kv_arg
+    )
+
+
 def _log_profile_if_needed(metadata: MACMetadata, config: Any, layer_idx: int) -> None:
     if not config.mac_profile:
         return
@@ -1101,9 +1384,7 @@ def llama_attention_forward_around(original_fn: Any, self: Any, *args: Any, **kw
                 layer_idx,
             )
         capacity = int(config.mac_lookback_tokens_left)
-        max_running = int(
-            getattr(server_args, "max_running_requests", forward_batch.batch_size)
-        )
+        max_running = _max_running_requests(server_args, forward_batch)
         request_capacity = _active_request_capacity(forward_batch, max_running)
         cache_ready = (
             metadata.unified_query_cache is not None
@@ -1208,7 +1489,7 @@ def llama_attention_forward_around(original_fn: Any, self: Any, *args: Any, **kw
             config,
             _active_request_capacity(
                 forward_batch,
-                int(getattr(server_args, "max_running_requests", forward_batch.batch_size)),
+                _max_running_requests(server_args, forward_batch),
             ),
         )
     with profile_block(
@@ -1294,9 +1575,7 @@ def _llama_attention_forward_mac_direct(
                 layer_idx,
             )
         capacity = int(config.mac_lookback_tokens_left)
-        max_running = int(
-            getattr(server_args, "max_running_requests", forward_batch.batch_size)
-        )
+        max_running = _max_running_requests(server_args, forward_batch)
         request_capacity = _active_request_capacity(forward_batch, max_running)
         cache_ready = (
             metadata.unified_query_cache is not None
@@ -1401,7 +1680,7 @@ def _llama_attention_forward_mac_direct(
             config,
             _active_request_capacity(
                 forward_batch,
-                int(getattr(server_args, "max_running_requests", forward_batch.batch_size)),
+                _max_running_requests(server_args, forward_batch),
             ),
         )
     with profile_block(

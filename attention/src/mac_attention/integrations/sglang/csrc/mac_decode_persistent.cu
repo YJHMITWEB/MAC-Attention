@@ -11,6 +11,9 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <map>
+#include <mutex>
+#include <utility>
 
 using torch::Tensor;
 namespace cg = cooperative_groups;
@@ -23,6 +26,7 @@ namespace {
 
 constexpr int kHeadDim = 128;
 constexpr int kMaxWarps = 8;
+constexpr int kMaxGroupSize = 16;
 constexpr int kMaxStageTokens = 16;
 constexpr int kMaxFuseTailTilesInMerge = 8;
 constexpr int kRectReduceChunk = 32;
@@ -37,13 +41,75 @@ constexpr float kLn2 = 0.6931471805599453094f;
 constexpr int kGroupModeMacHit = 0;
 constexpr int kGroupModeFullFallback = 1;
 constexpr int kGroupModeMixedFallback = 2;
-constexpr int kDirectZ2Group = 4;
-constexpr int kDirectZ2ZParts = 2;
-constexpr int kDirectZ2StageTokens = kDirectZ2Group * kDirectZ2ZParts;
-constexpr int kDirectZ2SmemBytes =
-    2 * 2 * kDirectZ2StageTokens * kHeadDim * static_cast<int>(sizeof(__nv_bfloat16)) +
-    kDirectZ2Group * kDirectZ2ZParts * kHeadDim * static_cast<int>(sizeof(float)) +
-    kDirectZ2Group * kDirectZ2ZParts * static_cast<int>(sizeof(float));
+// z2 group-direct producer layout: the block splits into 16-lane subwarps,
+// one per (head-in-group, z-part). kStageTokens = kGroup * kZParts =
+// blockDim / 16 tokens are staged per iteration and each z-part consumes its
+// own kGroup-token half, so the stage barrier only spans one z-part.
+// The (block_threads, group_size) -> kZParts support table lives in
+// z2_parts_for_config(); scheduler emission, producer dispatch and the
+// log2-domain fast reducers must all consult it (a mismatch silently drops
+// tasks or mixes LSE domains).
+__host__ __device__ __forceinline__ int z2_parts_for_config(int block_threads,
+                                                            int group_size,
+                                                            int head_dim) {
+  if (head_dim != kHeadDim) return 0;
+  if (block_threads == 128 && group_size == 4) return 2;
+  if (block_threads == 256 && group_size == 8) return 2;
+  // group_size > kMaxWarps is rejected at the launcher (per-head phases map
+  // one warp per head); such models take the FlashInfer fallback in python.
+  return 0;
+}
+
+// cp_async ring depth for the z2 producers. Two stages (8-16KB in flight per
+// CTA) cannot cover HBM latency at 2 blocks/SM (block 256 measured ~30% of
+// FlashInfer's streaming rate on full-fallback groups); four stages keep
+// 32KB in flight. Prefetch depth only — the compute order and math are
+// untouched.
+// Per-variant: block 256 runs only 2 blocks/SM, so per-CTA in-flight depth
+// carries the whole SM's memory parallelism (8 stages = 64KB in flight);
+// block 128 runs 5 blocks/SM and a deeper ring would cost that occupancy
+// (5 -> 4 at 8 stages), so it keeps 4.
+constexpr int z2_pipeline_bufs(int stage_tokens) {
+  // 8 deep for both block variants. Block 128 sits at 4 blocks/SM either way
+  // (register-file granularity, not shared memory, is the occupancy limiter:
+  // shrinking the pool to 16.1KB did NOT restore 5/SM but halving the ring
+  // cost ~5-9% on fallback streaming), so keep the full ring depth.
+  return 8;
+}
+
+constexpr int direct_z2_smem_bytes(int stage_tokens) {
+  return z2_pipeline_bufs(stage_tokens) * 2 * stage_tokens * kHeadDim *
+             static_cast<int>(sizeof(__nv_bfloat16)) +
+         stage_tokens * kHeadDim * static_cast<int>(sizeof(float)) +
+         stage_tokens * static_cast<int>(sizeof(float));
+}
+
+constexpr int cmax_i(int a, int b) { return a > b ? a : b; }
+
+// One dynamic shared pool time-sliced by every phase that needs bulk shared
+// memory. Declaring these arrays statically per phase made ptxas SUM them
+// (~30KB static + 12KB dynamic per block), capping occupancy at 4 blocks/SM;
+// pooling drops per-block shared memory to ~13KB. Phases touching the pool
+// must be separated by grid.sync() or start with __syncthreads().
+// Compact producer: 2 buffers (double-buffered cp_async) x {K, V} stages.
+constexpr int kCompactStageSmemBytes =
+    2 * 2 * kMaxStageTokens * kHeadDim * static_cast<int>(sizeof(__nv_bfloat16));
+// Head-vec reducers stage blockDim/16 rows of one head vector each.
+constexpr int head_vec_reduce_smem_bytes(int rows) {
+  return (rows * kHeadDim + rows + rows) * static_cast<int>(sizeof(float));
+}
+constexpr int kMergeFusedTailSmemBytes =
+    (kMaxFuseTailTilesInMerge * kHeadDim + kMaxFuseTailTilesInMerge) *
+    static_cast<int>(sizeof(float));
+// The z2 stage footprint and the head-vec row count both scale with
+// blockDim/16, so the pool is sized per block variant (12.3KB z2 / 16.4KB
+// compact at 128 threads; 24.6KB z2 at 256 threads).
+constexpr int smem_pool_bytes(int block_threads) {
+  return cmax_i(direct_z2_smem_bytes(block_threads / 16),
+                cmax_i(kCompactStageSmemBytes,
+                       cmax_i(head_vec_reduce_smem_bytes(block_threads / 16),
+                              kMergeFusedTailSmemBytes)));
+}
 
 struct Params {
   int32_t N;
@@ -60,10 +126,24 @@ struct Params {
   int32_t max_tiles_reduce;
   int32_t max_tiles_tail;
   int32_t tile_tokens;
+  // Tail tiles use their own (larger) granularity: the tail span is a fixed
+  // ~semantic_pos_ahead tokens per group, and slicing it into tile_tokens
+  // pieces made hundreds of tiny tasks whose fixed costs dominated.
+  int32_t tail_tile_tokens;
+  // Tail prepass: tail bounds depend only on past_len (never on match
+  // results), and tail partial writes are idempotent stores, so the whole
+  // tail phase can run alongside the latency-bound match scan in phase 1.
+  // The scheduler then emits no tail tasks and phase 4 merges the partials.
+  int32_t tail_prepass;
   int32_t stage_tokens;
   int32_t match_tile_slots;
   int32_t match_early_exit;
   int32_t semantic_pos_ahead;
+  // Front-sink exclusion (v2): ring entries written with prefix end E cover
+  // exactly [min(front_sink_tokens, E), E). The excluded sink region is
+  // recomputed under the CURRENT query at every reuse (like the band) and
+  // merged into the output only — never stored, never subtracted.
+  int32_t front_sink_tokens;
   int32_t gen_min_limit;
   int32_t lookback_right;
   int32_t candidate_mode;
@@ -110,6 +190,7 @@ struct Params {
   int32_t mixed_misspack_z2;
   int32_t sparse_fallback_unfuse_tail;
   int32_t mixed_group_direct_min_miss_heads;
+  int32_t task_overhead_tokens;
   int32_t bench_mode;
   int32_t bench_exact_quota;
   int32_t bench_seed;
@@ -124,7 +205,29 @@ struct Params {
   float bench_skip_ratio_std;
   float bench_match_lag_mean;
   float bench_match_lag_std;
+  // Device-side readiness gate (CUDA-graph replay safe). Python cannot gate
+  // the persistent path per step once the launch is baked into a graph, so
+  // the kernel itself must decide per request: a request whose MAC cache is
+  // not ready (prefill offload pending, epoch mismatch after slot reuse, or
+  // low-hit ejection) runs as pure full-fallback attention and must neither
+  // read match state nor write any cache row (the offload may be writing the
+  // same rows concurrently). Null pointers mean "all requests ready" (bench
+  // and check harnesses).
+  const uint8_t* cache_ready_ptr;
+  const int64_t* cache_epoch_ptr;
+  const int64_t* request_epoch_ptr;
 };
+
+__device__ __forceinline__ bool request_persistent_ready(const Params& p, int req) {
+  if (p.cache_ready_ptr == nullptr) return true;
+  if (req < 0) return false;
+  if (p.cache_ready_ptr[req] == 0) return false;
+  if (p.cache_epoch_ptr != nullptr && p.request_epoch_ptr != nullptr &&
+      p.cache_epoch_ptr[req] != p.request_epoch_ptr[req]) {
+    return false;
+  }
+  return true;
+}
 
 __device__ __forceinline__ float bf16_to_float(__nv_bfloat16 v) {
   return __bfloat162float(v);
@@ -199,12 +302,21 @@ __device__ __forceinline__ void cp_async_wait_group() {
 #endif
 }
 
-__device__ __forceinline__ void z2_stage_half_sync(int tz) {
+// Stage barrier for one z-part of the z2 producers: z-part `tz` is the
+// kGroup*16 contiguous threads that both load and consume stage slots
+// [tz*kGroup, (tz+1)*kGroup), so only they need to converge between stages.
+// Named barriers 1..kZParts (0 is __syncthreads); kZParts == 1 degenerates to
+// a full block barrier.
+template <int kGroup, int kZParts>
+__device__ __forceinline__ void z2_stage_part_sync(int tz) {
 #if defined(__CUDA_ARCH__)
-  if (tz == 0) {
-    asm volatile("bar.sync 1, 64;\n" ::: "memory");
+  if constexpr (kZParts == 1) {
+    __syncthreads();
+    (void)tz;
   } else {
-    asm volatile("bar.sync 2, 64;\n" ::: "memory");
+    constexpr int kPartThreads = kGroup * 16;
+    static_assert(kZParts <= 8, "named-barrier budget");
+    asm volatile("bar.sync %0, %1;\n" ::"r"(tz + 1), "n"(kPartThreads) : "memory");
   }
 #else
   (void)tz;
@@ -275,24 +387,38 @@ __device__ __forceinline__ int bench_target_miss_units(const Params& p, int unit
   return miss_units;
 }
 
+// True when this launch has a z2 group-direct producer instantiation for
+// p.group_size (see z2_parts_for_config). Every specialized full-fallback
+// path hangs off this: the z2 producer emits full-fallback band partials in
+// LOG2 domain when the warp/head-vec reducers are active, so the gates below
+// must stay in lockstep with producer dispatch.
+__device__ __forceinline__ bool group_direct_z2_supported(const Params& p) {
+  return z2_parts_for_config(static_cast<int>(blockDim.x), p.group_size, p.D) > 0;
+}
+
+__device__ __forceinline__ bool tail_prepass_active(const Params& p) {
+  return p.tail_prepass != 0 && p.tail_group_direct_z2 != 0 &&
+         group_direct_z2_supported(p);
+}
+
 __device__ __forceinline__ bool full_fallback_warp_reduce_enabled(const Params& p) {
   return p.full_fallback_warp_reduce != 0 && p.full_fallback_group_direct != 0 &&
-         p.group_size == 4 && p.D == kHeadDim && blockDim.x >= 128;
+         group_direct_z2_supported(p) && blockDim.x >= 128;
 }
 
 __device__ __forceinline__ bool full_fallback_head_reduce_enabled(const Params& p) {
   return p.full_fallback_head_reduce != 0 && full_fallback_warp_reduce_enabled(p) &&
-         p.group_size == 4 && p.D == kHeadDim && blockDim.x == 128;
+         (blockDim.x == 128 || blockDim.x == 256);
 }
 
 __device__ __forceinline__ bool mixed_head_reduce_enabled(const Params& p) {
-  return p.mixed_head_reduce != 0 && p.group_size == 4 && p.D == kHeadDim &&
-         blockDim.x == 128;
+  return p.mixed_head_reduce != 0 && p.D == kHeadDim &&
+         (blockDim.x == 128 || blockDim.x == 256);
 }
 
 __device__ __forceinline__ bool mixed_group_direct_z2_enabled(const Params& p) {
   return p.mixed_group_direct_z2 != 0 && p.full_fallback_group_direct != 0 &&
-         p.group_size == 4 && p.D == kHeadDim && blockDim.x == 128;
+         group_direct_z2_supported(p);
 }
 
 __device__ __forceinline__ bool mixed_misspack_z2_enabled(const Params& p) {
@@ -300,15 +426,13 @@ __device__ __forceinline__ bool mixed_misspack_z2_enabled(const Params& p) {
 }
 
 __device__ __forceinline__ bool tail_group_direct_z2_enabled(const Params& p) {
-  return p.tail_group_direct_z2 != 0 && p.group_size == 4 && p.D == kHeadDim &&
-         blockDim.x == 128;
+  return p.tail_group_direct_z2 != 0 && group_direct_z2_supported(p);
 }
 
 __device__ __forceinline__ bool complete_group_direct_z2_selected(
     const Params& p, int mode, int miss_heads) {
   if (mode == kGroupModeFullFallback) {
-    return p.full_fallback_group_direct != 0 && p.group_size == 4 && p.D == kHeadDim &&
-           blockDim.x == 128;
+    return p.full_fallback_group_direct != 0 && group_direct_z2_supported(p);
   }
   return mode == kGroupModeMixedFallback && p.mixed_early_miss_direct != 0 &&
          mixed_group_direct_z2_enabled(p) && p.mixed_group_direct_min_miss_heads > 0 &&
@@ -433,6 +557,11 @@ __device__ __forceinline__ int full_fallback_tile_tokens_for_mixed_schedule(
   if (full_fallback_groups <= 0 || full_fallback_groups >= total_groups) {
     return 0;
   }
+  // No mixed groups: the phase2 balancer wave-quantizes task_counts[4]
+  // against the grid; this ramp-based override would undo that.
+  if (task_counts[5] == task_counts[6]) {
+    return 0;
+  }
 
   int target_ctas = dense_full_fallback_target_ctas_for(p, task_counts);
   if (full_fallback_groups * 2 <= total_groups) {
@@ -482,8 +611,10 @@ __device__ __forceinline__ bool sparse_fallback_unfuse_tail_active(
 __device__ __forceinline__ bool mixed_fallback_tail_fuse_active(
     const Params& p,
     int tail_tiles) {
+  // Under the tail prepass the partials already exist; fusing would just
+  // recompute the same tokens inline in the merge.
   return p.fuse_mixed_fallback_tail_in_merge != 0 &&
-         p.fuse_hit_tail_in_merge != 0 &&
+         p.fuse_hit_tail_in_merge != 0 && !tail_prepass_active(p) &&
          tail_tiles > 0 && tail_tiles <= kMaxFuseTailTilesInMerge;
 }
 
@@ -543,6 +674,11 @@ __device__ __forceinline__ int full_fallback_producer_coarsen_for(
       full_fallback_groups >= total_groups) {
     return 1;
   }
+  // No mixed groups: the wave-quantized balancer chunk is already sized to
+  // the grid; coarsening would break its wave alignment.
+  if (task_counts[5] == task_counts[6]) {
+    return 1;
+  }
   // Coarsen only when full-KV groups are dense inside a mixed schedule. In
   // that regime the full-KV producers create many partial states and the later
   // reduce/merge phases dominate. Pure all-full schedules keep the existing
@@ -577,6 +713,86 @@ __device__ __forceinline__ int producer_rect_tile_tokens_for(
 __device__ __forceinline__ int cache_end_for_pos(int p, int S) {
   int end = p + 1 - S;
   return end > 0 ? end : 0;
+}
+
+__device__ __forceinline__ int clamp_front_sink_end(const Params& p, int rect_end) {
+  int end = p.front_sink_tokens;
+  if (end < 0) end = 0;
+  if (end > rect_end) end = rect_end;
+  return end;
+}
+
+__device__ __forceinline__ int head_front_sink_end(const Params& p,
+                                                   int head_rect_start,
+                                                   int head_rect_end) {
+  int end = clamp_front_sink_end(p, head_rect_end);
+  if (end > head_rect_start) end = head_rect_start;
+  return end > 0 ? end : 0;
+}
+
+__device__ __forceinline__ bool rect_pos_contributes_to_head(
+    const Params& p, int pos, int head_rect_start, int head_rect_end) {
+  int sink_end = head_front_sink_end(p, head_rect_start, head_rect_end);
+  return (pos >= 0 && pos < sink_end) ||
+         (pos >= head_rect_start && pos < head_rect_end);
+}
+
+__device__ __forceinline__ bool rect_tile_overlaps_head(
+    const Params& p, int begin, int end, int head_rect_start, int head_rect_end) {
+  if (end <= begin) return false;
+  int sink_end = head_front_sink_end(p, head_rect_start, head_rect_end);
+  bool sink_overlap = sink_end > 0 && begin < sink_end && end > 0;
+  bool band_overlap = end > head_rect_start && begin < head_rect_end;
+  return sink_overlap || band_overlap;
+}
+
+__device__ __forceinline__ int front_sink_tiles_for_group(
+    const Params& p, int mode, int rect_end) {
+  // Exclusion design: every group mode emits sink tiles [0, min(F, rect_end))
+  // ahead of its band tiles; hit heads use them to complement the sink-excluded
+  // reused entry, miss heads use them as the head of their full recompute.
+  (void)mode;
+  if (p.front_sink_tokens <= 0) return 0;
+  int sink_end = clamp_front_sink_end(p, rect_end);
+  return sink_end > 0 ? ceil_div_i32(sink_end, p.tile_tokens) : 0;
+}
+
+__device__ __forceinline__ int complete_tiles_for_group(
+    const Params& p,
+    const int32_t* __restrict__ task_counts,
+    int mode,
+    int group_begin,
+    int group_end) {
+  int rect_tokens = group_end - group_begin;
+  int tile_tokens = producer_rect_tile_tokens_for(p, task_counts, mode, rect_tokens);
+  int band_tiles = rect_tokens > 0 ? ceil_div_i32(rect_tokens, tile_tokens) : 0;
+  return front_sink_tiles_for_group(p, mode, group_end) + band_tiles;
+}
+
+__device__ __forceinline__ bool complete_tile_bounds(
+    const Params& p,
+    const int32_t* __restrict__ task_counts,
+    int mode,
+    int group_begin,
+    int group_end,
+    int tile,
+    int& begin,
+    int& end,
+    bool& is_front_sink_tile) {
+  int sink_tiles = front_sink_tiles_for_group(p, mode, group_end);
+  if (tile < sink_tiles) {
+    begin = tile * p.tile_tokens;
+    end = min(begin + p.tile_tokens, clamp_front_sink_end(p, group_end));
+    is_front_sink_tile = true;
+    return end > begin;
+  }
+  int rect_tokens = group_end - group_begin;
+  int tile_tokens = producer_rect_tile_tokens_for(p, task_counts, mode, rect_tokens);
+  int band_tile = tile - sink_tiles;
+  begin = group_begin + band_tile * tile_tokens;
+  end = min(begin + tile_tokens, group_end);
+  is_front_sink_tile = false;
+  return end > begin;
 }
 
 __device__ __forceinline__ int ring_slot_to_pos(int past_len, int M, int slot) {
@@ -673,6 +889,56 @@ __device__ __forceinline__ void merge_scalar(float& state_lse, bool& state_valid
   state_lse = out_lse;
 }
 
+__device__ __forceinline__ void merge_partial_rect_tile_into_state(
+    const Params& p,
+    int64_t lse_off,
+    bool use_reduced_rect,
+    const void* __restrict__ partial_rect_o,
+    const float* __restrict__ partial_rect_lse,
+    const void* __restrict__ partial_rect_reduced_o,
+    const float* __restrict__ partial_rect_reduced_lse,
+    int dim,
+    bool owns_dim,
+    float& acc,
+    float& state_lse,
+    bool& state_valid,
+    float* sh_lse,
+    bool* sh_valid,
+    float* sh_w_state,
+    float* sh_w_other,
+    bool* sh_take_other,
+    bool* sh_other_valid) {
+  if (threadIdx.x == 0) {
+    float w_state = 1.0f, w_other = 0.0f;
+    bool take_other = false;
+    float other_lse =
+        use_reduced_rect ? partial_rect_reduced_lse[lse_off] : partial_rect_lse[lse_off];
+    bool other_valid = isfinite(other_lse);
+    merge_scalar(state_lse, state_valid, other_lse, w_state, w_other, take_other);
+    *sh_lse = state_lse;
+    *sh_valid = state_valid;
+    *sh_w_state = w_state;
+    *sh_w_other = w_other;
+    *sh_take_other = take_other;
+    *sh_other_valid = other_valid;
+  }
+  __syncthreads();
+  state_lse = *sh_lse;
+  state_valid = *sh_valid;
+  if (owns_dim && (*sh_take_other || *sh_other_valid)) {
+    float other =
+        use_reduced_rect
+            ? load_partial_o(partial_rect_reduced_o, lse_off * p.D + dim, p.partial_o_bf16)
+            : load_partial_o(partial_rect_o, lse_off * p.D + dim, p.partial_o_bf16);
+    if (*sh_take_other) {
+      acc = other;
+    } else {
+      acc = *sh_w_state * acc + *sh_w_other * other;
+    }
+  }
+  __syncthreads();
+}
+
 __device__ void phase1_match_scan(
     const Params& p,
     const __nv_bfloat16* __restrict__ q_pre,
@@ -682,10 +948,20 @@ __device__ void phase1_match_scan(
     float* __restrict__ match_dist,
     int32_t* __restrict__ match_pos,
     int32_t* __restrict__ match_slot) {
+  // v2: one warp scans two slots per iteration (one per 16-thread subwarp)
+  // with fully vectorized 16B loads. When match_early_exit is set, a cheap
+  // probe over the first 32 dims filters slots first: the partial sum of
+  // squares is a lower bound on the full distance, so "probe > threshold"
+  // can never discard a hit, and every surviving slot gets its exact full
+  // distance. Unlike the old per-32-dim early exit, the probe loads carry no
+  // serial dependency between slots, so the memory pipeline stays saturated.
   const int total = p.N * p.Hq * p.max_match_tiles;
   const int warps = blockDim.x >> 5;
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
+  const int half = lane >> 4;  // which slot of the pair this subwarp owns
+  const int tx = lane & 15;
+  const unsigned sub_mask = (lane & 16) ? 0xffff0000u : 0x0000ffffu;
 
   for (int task = blockIdx.x * warps + warp; task < total; task += gridDim.x * warps) {
     int t = task;
@@ -700,60 +976,119 @@ __device__ void phase1_match_scan(
     if (p.candidate_mode == 1) {
       candidate_end = max(candidate_begin, past_len - p.lookback_right);
     }
-    bool eligible = past_len >= p.gen_min_limit && candidate_end > candidate_begin;
+    int req = req_ids[n];
+    bool eligible = past_len >= p.gen_min_limit && candidate_end > candidate_begin &&
+                    request_persistent_ready(p, req);
 
     float best_d = kInf;
     int best_p = INT_MAX;
     int best_s = -1;
     int slot_begin = tile * p.match_tile_slots;
     int slot_end = min(p.M, slot_begin + p.match_tile_slots);
-    int req = req_ids[n];
-    float q_vals[4];
-    int dims[4];
+    const int64_t q_base = (static_cast<int64_t>(n) * p.Hq + hq) * p.D;
+    // Full-precision lane view: dims [tx*8, tx*8+8) (D == kHeadDim == 128).
+    float q_full[8];
+    {
+      Bf16x8 qv = load_bf16x8(&q_pre[q_base + tx * 8]);
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      int d = lane + i * 32;
-      dims[i] = d;
-      q_vals[i] = 0.0f;
-      if (d < p.D) {
-        int64_t q_off = (static_cast<int64_t>(n) * p.Hq + hq) * p.D + d;
-        q_vals[i] = bf16_to_float(q_pre[q_off]);
-      }
+      for (int i = 0; i < 8; ++i) q_full[i] = bf16_to_float(qv.v[i]);
     }
+    // Probe lane view: dims [tx*2, tx*2+2) covering [0, 32), plus a second
+    // stage over [32, 64) for slots the first stage cannot separate from the
+    // threshold. Both stages are partial sums of squared differences, i.e.
+    // exact lower bounds on the full distance — pruning never drops a match
+    // and accepted candidates still get the identical full evaluation.
+    float q_probe[2];
+    q_probe[0] = bf16_to_float(q_pre[q_base + tx * 2]);
+    q_probe[1] = bf16_to_float(q_pre[q_base + tx * 2 + 1]);
+    float q_probe2[2];
+    q_probe2[0] = bf16_to_float(q_pre[q_base + 32 + tx * 2]);
+    q_probe2[1] = bf16_to_float(q_pre[q_base + 32 + tx * 2 + 1]);
+    const bool use_probe = p.match_early_exit != 0;
+    const float thr = p.threshold_distance;
+    const int64_t cache_base = (static_cast<int64_t>(req) * p.M) * p.Hq + hq;
 
-    for (int slot = slot_begin; slot < slot_end; ++slot) {
-      int logical_pos = ring_slot_to_pos(past_len, p.M, slot);
-      bool valid = eligible && logical_pos >= candidate_begin && logical_pos < candidate_end;
-      float acc = 0.0f;
-      if (valid) {
-        int64_t c_off = (((static_cast<int64_t>(req) * p.M + slot) * p.Hq + hq) * p.D);
+    // Four slot pairs per iteration: all eight 4B probe loads (64 probe dims
+    // per slot) are issued before any reduction, so the global-memory latency
+    // overlaps the shuffle chains instead of serializing them — the match
+    // phase is latency-bound, not bandwidth-bound. The probe remains an exact
+    // lower bound and surviving slots take the identical full evaluation.
+    for (int s0 = slot_begin; s0 < slot_end; s0 += 8) {
+      uint32_t raw_a[4];
+      uint32_t raw_b[4];
+      bool pair_valid[4];
+      int pair_pos[4];
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-          int d = dims[i];
-          if (d >= p.D) continue;
-          float a = q_vals[i];
-          float b = bf16_to_float(query_cache[c_off + d]);
-          float diff = a - b;
-          acc = fmaf(diff, diff, acc);
-          if (p.match_early_exit != 0) {
-            float partial = warp_sum(acc);
-            int over_threshold =
-                __shfl_sync(0xffffffffu, partial > p.threshold_distance ? 1 : 0, 0);
-            if (over_threshold != 0) {
-              break;
-            }
+      for (int u = 0; u < 4; ++u) {
+        int slot = s0 + 2 * u + half;
+        int logical_pos = ring_slot_to_pos(past_len, p.M, slot);
+        bool valid = slot < slot_end && eligible && logical_pos >= candidate_begin &&
+                     logical_pos < candidate_end;
+        pair_valid[u] = valid;
+        pair_pos[u] = logical_pos;
+        raw_a[u] = 0u;
+        raw_b[u] = 0u;
+        if (use_probe && valid) {
+          const int64_t c_off = (cache_base + static_cast<int64_t>(slot) * p.Hq) * p.D;
+          raw_a[u] = *reinterpret_cast<const uint32_t*>(&query_cache[c_off + tx * 2]);
+          raw_b[u] = *reinterpret_cast<const uint32_t*>(&query_cache[c_off + 32 + tx * 2]);
+        }
+      }
+#pragma unroll
+      for (int u = 0; u < 4; ++u) {
+        int slot = s0 + 2 * u + half;
+        bool valid = pair_valid[u];
+        int logical_pos = pair_pos[u];
+        const int64_t c_off = (cache_base + static_cast<int64_t>(slot) * p.Hq) * p.D;
+        bool evaluate = valid;
+        if (use_probe) {
+          float probe = 0.0f;
+          if (valid) {
+            __nv_bfloat162 pa = *reinterpret_cast<const __nv_bfloat162*>(&raw_a[u]);
+            __nv_bfloat162 pb = *reinterpret_cast<const __nv_bfloat162*>(&raw_b[u]);
+            float d0 = q_probe[0] - bf16_to_float(pa.x);
+            float d1 = q_probe[1] - bf16_to_float(pa.y);
+            float e0 = q_probe2[0] - bf16_to_float(pb.x);
+            float e1 = q_probe2[1] - bf16_to_float(pb.y);
+            probe = fmaf(d0, d0, d1 * d1);
+            probe = fmaf(e0, e0, probe);
+            probe = fmaf(e1, e1, probe);
+          }
+          probe = subwarp16_xor_sum(probe, sub_mask);
+          evaluate = valid && probe <= thr;
+        }
+        unsigned eval_mask = __ballot_sync(0xffffffffu, evaluate);
+        if (eval_mask & sub_mask) {
+          float acc = 0.0f;
+          Bf16x8 cv = load_bf16x8(&query_cache[c_off + tx * 8]);
+#pragma unroll
+          for (int i = 0; i < 8; ++i) {
+            float diff = q_full[i] - bf16_to_float(cv.v[i]);
+            acc = fmaf(diff, diff, acc);
+          }
+          acc = subwarp16_xor_sum(acc, sub_mask);
+          // xor butterfly leaves the total on every lane of the subwarp, so
+          // all lanes track an identical running best for their slot stream.
+          if (valid && better_pair(acc, logical_pos, best_d, best_p)) {
+            best_d = acc;
+            best_p = logical_pos;
+            best_s = slot;
           }
         }
       }
-      acc = warp_sum(acc);
-      if (lane == 0 && valid && better_pair(acc, logical_pos, best_d, best_p)) {
-        best_d = acc;
-        best_p = logical_pos;
-        best_s = slot;
-      }
     }
 
+    // Combine the two subwarp bests; every lane of a subwarp holds the same
+    // value, so lane 16's copy represents the odd-slot stream.
+    float other_d = __shfl_sync(0xffffffffu, best_d, 16);
+    int other_p = __shfl_sync(0xffffffffu, best_p, 16);
+    int other_s = __shfl_sync(0xffffffffu, best_s, 16);
     if (lane == 0) {
+      if (better_pair(other_d, other_p, best_d, best_p)) {
+        best_d = other_d;
+        best_p = other_p;
+        best_s = other_s;
+      }
       int64_t off = (static_cast<int64_t>(n) * p.Hq + hq) * p.max_match_tiles + tile;
       match_dist[off] = best_d;
       match_pos[off] = best_p;
@@ -843,7 +1178,8 @@ __device__ void phase2_reduce_schedule(
       int candidate_end = (p.candidate_mode == 1)
                               ? max(candidate_begin, past_len - p.lookback_right)
                               : past_len;
-      bool eligible = past_len >= p.gen_min_limit && candidate_end > candidate_begin;
+      bool eligible = past_len >= p.gen_min_limit && candidate_end > candidate_begin &&
+                      request_persistent_ready(p, req_ids[n]);
       bool hit = eligible && best_s >= 0 && best_d < p.threshold_distance;
       if (p.bench_mode != 0 || p.bench_miss_mask >= 0) {
         // bench_mode 1: independent per-query-head hit decisions.
@@ -941,6 +1277,18 @@ __device__ void phase2_reduce_schedule(
         prefix_end = cache_end_for_pos(mpos, p.semantic_pos_ahead);
         rect_start = prefix_end;
       }
+      // Front-sink exclusion: an entry with prefix_end < F covers nothing (its
+      // whole span lies inside the excluded sink region), and reusing it would
+      // break the write-back coverage invariant [min(F, E), E). Demote to miss;
+      // unreachable under production configs (matches sit at prefix_end >=
+      // gen_min_limit - M - r, far above any practical F).
+      if (hit && p.front_sink_tokens > 0 && prefix_end < p.front_sink_tokens) {
+        hit = false;
+        mpos = -1;
+        mslot = -1;
+        prefix_end = 0;
+        rect_start = 0;
+      }
       int new_end = cache_end_for_pos(past_len, p.semantic_pos_ahead);
       int64_t ho = static_cast<int64_t>(n) * p.Hq + hq;
       head_hit[ho] = hit ? 1 : 0;
@@ -992,8 +1340,13 @@ __device__ void phase2_reduce_schedule(
     }
     int rect_end = new_end;
     int tail_begin = new_end;
+    // Front-sink exclusion: miss-head recompute is split into sink tiles
+    // [0, fs_begin) plus band tiles [fs_begin, new_end); the sink part is
+    // output-only so the written entry covers exactly [fs_begin, new_end).
+    // fs_begin == 0 when front_sink_tokens == 0 (legacy behavior).
+    int fs_begin = clamp_front_sink_end(p, new_end);
     if (mode == kGroupModeFullFallback) {
-      complete_begin = 0;
+      complete_begin = fs_begin;
       for (int lane_i = 0; lane_i < p.group_size; ++lane_i) {
         int hq = hq0 + lane_i;
         int64_t ho = static_cast<int64_t>(n) * p.Hq + hq;
@@ -1001,11 +1354,11 @@ __device__ void phase2_reduce_schedule(
         head_match_slot[ho] = -1;
         head_match_pos[ho] = -1;
         head_prefix_end[ho] = 0;
-        head_rect_start[ho] = 0;
+        head_rect_start[ho] = fs_begin;
         head_new_end[ho] = rect_end;
       }
     } else if (mode == kGroupModeMixedFallback) {
-      complete_begin = 0;
+      complete_begin = fs_begin;
       for (int lane_i = 0; lane_i < p.group_size; ++lane_i) {
         int hq = hq0 + lane_i;
         int64_t ho = static_cast<int64_t>(n) * p.Hq + hq;
@@ -1023,14 +1376,15 @@ __device__ void phase2_reduce_schedule(
         head_match_slot[ho] = -1;
         head_match_pos[ho] = -1;
         head_prefix_end[ho] = 0;
-        head_rect_start[ho] = 0;
+        head_rect_start[ho] = fs_begin;
         head_new_end[ho] = new_end;
       }
     }
 
     complete_begin = max(0, min(complete_begin, rect_end));
     int rect_tokens = rect_end - complete_begin;
-    int tail_tiles = (kv_len > tail_begin) ? ceil_div_i32(kv_len - tail_begin, p.tile_tokens) : 0;
+    int tail_tiles =
+        (kv_len > tail_begin) ? ceil_div_i32(kv_len - tail_begin, p.tail_tile_tokens) : 0;
     int64_t go = static_cast<int64_t>(n) * p.Hkv + hkv;
     group_rect_begin[go] = complete_begin;
     group_rect_end[go] = rect_end;
@@ -1068,7 +1422,7 @@ __device__ void phase2_reduce_schedule(
         if (mode == kGroupModeMacHit && p.hit_complete_head_direct != 0) {
           mult = p.group_size;
         } else if (mode == kGroupModeFullFallback &&
-                   !(p.full_fallback_group_direct != 0 && p.group_size == 4) &&
+                   !(p.full_fallback_group_direct != 0 && group_direct_z2_supported(p)) &&
                    p.full_fallback_head_direct != 0) {
           mult = p.group_size;
         } else if (mode == kGroupModeMixedFallback && p.mixed_early_miss_direct != 0) {
@@ -1127,8 +1481,45 @@ __device__ void phase2_reduce_schedule(
         }
         if (target_ctas <= 0) target_ctas = gridDim.x;
         if (target_ctas < 1) target_ctas = 1;
+        // Never emit fewer chunks than the persistent grid can run at once:
+        // the env-tuned CTA targets (416/512) predate the higher-occupancy
+        // grid (570 at 5 blocks/SM), and a target below gridDim.x leaves CTAs
+        // idle while each busy CTA serially walks a ~30k-token chunk. Two
+        // chunks per CTA also shortens the straggler tail.
+        int min_parallel_ctas = 2 * static_cast<int>(gridDim.x);
+        if (target_ctas < min_parallel_ctas) target_ctas = min_parallel_ctas;
         long long raw = (weighted_tokens + static_cast<long long>(target_ctas) - 1LL) /
                         static_cast<long long>(target_ctas);
+        if (mixed_groups == 0 && task_counts[6] > 0) {
+          // Wave-quantized chunking for fallback-dominated schedules: a
+          // token-count-derived chunk lands on arbitrary task counts (e.g.
+          // 512 tasks on a 228-CTA grid = 2.25 waves, so the CTAs holding a
+          // third tile finish 1.5x after the rest). The producer's finish
+          // time is waves(k) * chunk(k) for k tiles per fallback group —
+          // pick k by direct search (single thread, k <= 64: negligible).
+          long long units = task_counts[6];
+          if (units < 1) units = 1;
+          long long grid_ctas = static_cast<long long>(gridDim.x);
+          // Each producer task pays a fixed cost (pipeline fill, per-task
+          // setup, partial write + later reduce/merge read) on top of its
+          // streaming time; charge it as token-equivalents so the search
+          // prefers few large chunks over many perfectly wave-aligned tiny
+          // ones (k=57 "exact 16 waves" measured slower than k=7's 2 waves).
+          const long long kTaskOverheadTokens = p.task_overhead_tokens;
+          long long best_cost = 0;
+          long long best_chunk = raw;
+          for (int k = 1; k <= 64; ++k) {
+            long long chunk = (static_cast<long long>(max_tokens) + k - 1) / k;
+            if (chunk < min_chunk) break;  // larger k only shrinks the chunk
+            long long waves = (units * k + grid_ctas - 1) / grid_ctas;
+            long long cost = waves * (chunk + kTaskOverheadTokens);
+            if (best_cost == 0 || cost < best_cost) {
+              best_cost = cost;
+              best_chunk = chunk;
+            }
+          }
+          raw = best_chunk;
+        }
         if (raw < min_chunk) raw = min_chunk;
         if (raw > max_tokens) raw = max_tokens;
         chosen = static_cast<int>(raw);
@@ -1140,8 +1531,18 @@ __device__ void phase2_reduce_schedule(
 
   grid.sync();
 
-  if (p.parallel_z2_schedule != 0 && task_counts[5] > 0 && task_counts[6] == 0 &&
-      mixed_group_direct_z2_enabled(p)) {
+  // Emit all z2 group tiles FIRST (contiguous low task indices) so the
+  // round-robin task loop deals every CTA an equal share of the big chunks.
+  // Serial per-group emission interleaves big fallback tiles with tiny hit
+  // tiles in atomic order, and a CTA that draws two big chunks becomes the
+  // straggler every other CTA waits on at the next grid sync (measured as a
+  // spurious ~2x "tail phase" at hit=0.5). Covers mixed-only schedules
+  // (original) and fallback+hit schedules with no mixed groups.
+  if (p.parallel_z2_schedule != 0 && task_counts[5] > 0 &&
+      (task_counts[6] == 0
+           ? mixed_group_direct_z2_enabled(p)
+           : (task_counts[5] == task_counts[6] &&
+              p.full_fallback_group_direct != 0 && group_direct_z2_supported(p)))) {
     __shared__ int sh_z2_base;
     for (int go_i = blockIdx.x; go_i < group_total; go_i += gridDim.x) {
       int64_t go = static_cast<int64_t>(go_i);
@@ -1151,9 +1552,7 @@ __device__ void phase2_reduce_schedule(
       int hq0 = hkv * p.group_size;
       int miss_heads = 0;
       if (mode == kGroupModeMixedFallback) {
-#pragma unroll
-        for (int lane_i = 0; lane_i < 4; ++lane_i) {
-          if (lane_i >= p.group_size) continue;
+        for (int lane_i = 0; lane_i < p.group_size; ++lane_i) {
           int hq = hq0 + lane_i;
           int64_t ho = static_cast<int64_t>(n) * p.Hq + hq;
           miss_heads += head_hit[ho] == 0 ? 1 : 0;
@@ -1164,18 +1563,42 @@ __device__ void phase2_reduce_schedule(
 
       int rect_tokens = group_rect_end[go] - group_rect_begin[go];
       int rect_tile_tokens = producer_rect_tile_tokens_for(p, task_counts, mode, rect_tokens);
-      int rect_tiles = rect_tokens > 0 ? ceil_div_i32(rect_tokens, rect_tile_tokens) : 0;
+      int rect_tiles =
+          complete_tiles_for_group(p, task_counts, mode, group_rect_begin[go], group_rect_end[go]);
       bool z2_selected = rect_tiles > 0 && complete_group_direct_z2_selected(p, mode, miss_heads);
       if (z2_selected) {
+        int misspack_tiles = 0;
+        bool use_misspack_prefix = false;
+        if (mode == kGroupModeMixedFallback && mixed_misspack_z2_enabled(p) && miss_heads > 0 &&
+            miss_heads * 2 <= p.group_size) {
+          int valid_begin = group_rect_end[go];
+          for (int lane_i = 0; lane_i < p.group_size; ++lane_i) {
+            int hq = hq0 + lane_i;
+            int64_t ho = static_cast<int64_t>(n) * p.Hq + hq;
+            if (head_hit[ho] != 0) {
+              valid_begin = min(valid_begin, head_rect_start[ho]);
+            }
+          }
+          int sink_tiles = front_sink_tiles_for_group(p, mode, group_rect_end[go]);
+          int direct_until = max(group_rect_begin[go], min(valid_begin, group_rect_end[go]));
+          misspack_tiles = sink_tiles + (direct_until - group_rect_begin[go]) / rect_tile_tokens;
+          if (misspack_tiles < 0) misspack_tiles = 0;
+          if (misspack_tiles > rect_tiles) misspack_tiles = rect_tiles;
+          use_misspack_prefix = misspack_tiles > 0;
+        }
         if (threadIdx.x == 0) {
           group_rect_tiles[go] = rect_tiles;
           sh_z2_base = atomicAdd(&task_counts[0], rect_tiles);
-          if (rect_tiles > rect_reduce_threshold_for_counts(p, mode, task_counts)) {
+          // Reduction operates on band tiles only (sink tiles are merged raw
+          // after the cache write), so threshold/chunk math counts band tiles.
+          int z2_band_tiles =
+              rect_tiles - front_sink_tiles_for_group(p, mode, group_rect_end[go]);
+          if (z2_band_tiles > rect_reduce_threshold_for_counts(p, mode, task_counts)) {
             atomicAdd(&task_counts[3], 1);
             int reduce_chunk = clamp_reduce_chunk_to_workspace(
-                balanced_rect_reduce_chunk_for_mode(p, mode, task_counts), rect_tiles,
+                balanced_rect_reduce_chunk_for_mode(p, mode, task_counts), z2_band_tiles,
                 p.max_tiles_reduce);
-            int reduced_tiles = ceil_div_i32(rect_tiles, reduce_chunk);
+            int reduced_tiles = ceil_div_i32(z2_band_tiles, reduce_chunk);
             if (mode == kGroupModeFullFallback) {
               atomicMax(&task_counts[7], reduced_tiles);
             } else {
@@ -1184,16 +1607,20 @@ __device__ void phase2_reduce_schedule(
           }
         }
         __syncthreads();
-        int32_t task_go_value = static_cast<int32_t>(go);
-        if (mode == kGroupModeMixedFallback) {
-          if (mixed_misspack_z2_enabled(p) && miss_heads > 0 &&
-              miss_heads * 2 <= p.group_size) {
-            task_go_value = static_cast<int32_t>(go + group_total * 2);
-          } else {
-            task_go_value = static_cast<int32_t>(go + group_total);
-          }
-        }
+        int sink_tiles_for_tag =
+            front_sink_tiles_for_group(p, mode, group_rect_end[go]);
         for (int tile = threadIdx.x; tile < rect_tiles; tile += blockDim.x) {
+          int32_t task_go_value = static_cast<int32_t>(go);
+          if (mode == kGroupModeMixedFallback) {
+            // Sink tiles contribute to every head (hit heads merge them
+            // output-only), so they must never take the miss-heads-only
+            // misspack tag.
+            task_go_value =
+                (use_misspack_prefix && tile >= sink_tiles_for_tag &&
+                 tile < misspack_tiles)
+                    ? static_cast<int32_t>(go + group_total * 2)
+                    : static_cast<int32_t>(go + group_total);
+          }
           int idx = sh_z2_base + tile;
           complete_task_go[idx] = task_go_value;
           complete_task_tile[idx] = tile;
@@ -1215,13 +1642,15 @@ __device__ void phase2_reduce_schedule(
     int hq0 = hkv * p.group_size;
     int valid_count = 0;
     int valid_complete_begin = INT_MAX;
-    bool valid_heads[kMaxWarps];
+    int hit_miss_heads = 0;  // head_hit-based count, mirrors the parallel-z2 emitter
+    bool valid_heads[kMaxGroupSize];
     for (int lane_i = 0; lane_i < p.group_size; ++lane_i) {
       int hq = hq0 + lane_i;
       int64_t ho = static_cast<int64_t>(n) * p.Hq + hq;
       int head_begin = head_rect_start[ho];
       int head_end = head_new_end[ho];
       int slot = head_match_slot[ho];
+      hit_miss_heads += head_hit[ho] == 0 ? 1 : 0;
       bool valid = head_hit[ho] != 0 && slot >= 0 && head_end == new_end;
       int complete_len = head_end - head_begin;
       if (valid) {
@@ -1241,14 +1670,19 @@ __device__ void phase2_reduce_schedule(
     int rect_end = group_rect_end[go];
     int rect_tokens = rect_end - complete_begin;
     int rect_tile_tokens = producer_rect_tile_tokens_for(p, task_counts, mode, rect_tokens);
-    int rect_tiles = rect_tokens > 0 ? ceil_div_i32(rect_tokens, rect_tile_tokens) : 0;
+    int rect_tiles =
+        complete_tiles_for_group(p, task_counts, mode, complete_begin, rect_end);
     int tail_begin = group_tail_begin[go];
     int tail_tiles = group_tail_tiles[go];
     group_rect_tiles[go] = rect_tiles;
     int miss_heads = p.group_size - valid_count;
+    // Must reproduce the parallel-z2 emitter's decision EXACTLY (it counts
+    // misses via head_hit, not via the stricter valid_heads criterion) —
+    // disagreement here either double-emits or drops a group's tasks.
     bool z2_complete_emitted_parallel =
-        p.parallel_z2_schedule != 0 && task_counts[6] == 0 &&
-        complete_group_direct_z2_selected(p, mode, miss_heads);
+        p.parallel_z2_schedule != 0 &&
+        (task_counts[6] == 0 || task_counts[5] == task_counts[6]) &&
+        complete_group_direct_z2_selected(p, mode, hit_miss_heads);
 
     if (rect_tiles > 0 &&
         !(mode == kGroupModeMacHit && all_hit_direct_active(p, task_counts)) &&
@@ -1266,9 +1700,11 @@ __device__ void phase2_reduce_schedule(
         }
       } else if (mode == kGroupModeMixedFallback && p.mixed_early_miss_direct != 0) {
         int direct_until = max(0, min(valid_complete_begin, new_end));
-        int direct_tiles = direct_until > complete_begin
-                               ? (direct_until - complete_begin) / rect_tile_tokens
-                               : 0;
+        int sink_tiles = front_sink_tiles_for_group(p, mode, rect_end);
+        int direct_tiles = sink_tiles +
+                           (direct_until > complete_begin
+                                ? (direct_until - complete_begin) / rect_tile_tokens
+                                : 0);
         if (direct_tiles > rect_tiles) direct_tiles = rect_tiles;
         bool use_mixed_z2_task =
             complete_group_direct_z2_selected(p, mode, miss_heads);
@@ -1276,29 +1712,45 @@ __device__ void phase2_reduce_schedule(
             use_mixed_z2_task && mixed_misspack_z2_enabled(p) && miss_heads > 0 &&
             miss_heads < p.group_size;
         if (direct_tiles > 0 && miss_heads > 0) {
-          if (p.mixed_group_direct_min_miss_heads > 0 &&
+          // Sink tiles contribute to every head (hit heads merge them
+          // output-only), so they are always emitted as full-group tasks and
+          // never per-miss-head or with the miss-heads-only misspack tag.
+          int sink_emit = min(sink_tiles, direct_tiles);
+          if (sink_emit > 0) {
+            int base = atomicAdd(&task_counts[0], sink_emit);
+            int32_t sink_go_value = use_mixed_z2_task
+                                        ? static_cast<int32_t>(go + group_total)
+                                        : static_cast<int32_t>(go);
+            for (int tile = 0; tile < sink_emit; ++tile) {
+              int idx = base + tile;
+              complete_task_go[idx] = sink_go_value;
+              complete_task_tile[idx] = tile;
+            }
+          }
+          int band_direct = direct_tiles - sink_emit;
+          if (band_direct > 0 && p.mixed_group_direct_min_miss_heads > 0 &&
               miss_heads >= p.mixed_group_direct_min_miss_heads) {
-            int base = atomicAdd(&task_counts[0], direct_tiles);
+            int base = atomicAdd(&task_counts[0], band_direct);
             int32_t task_go_value = static_cast<int32_t>(go);
             if (use_misspack_z2_task) {
               task_go_value = static_cast<int32_t>(go + group_total * 2);
             } else if (use_mixed_z2_task) {
               task_go_value = static_cast<int32_t>(go + group_total);
             }
-            for (int tile = 0; tile < direct_tiles; ++tile) {
-              int idx = base + tile;
+            for (int tile = sink_emit; tile < direct_tiles; ++tile) {
+              int idx = base + (tile - sink_emit);
               complete_task_go[idx] = task_go_value;
               complete_task_tile[idx] = tile;
             }
-          } else {
-            int base = atomicAdd(&task_counts[0], miss_heads * direct_tiles);
+          } else if (band_direct > 0) {
+            int base = atomicAdd(&task_counts[0], miss_heads * band_direct);
             int out_lane = 0;
             for (int lane_i = 0; lane_i < p.group_size; ++lane_i) {
               if (valid_heads[lane_i]) continue;
               int hq = hq0 + lane_i;
               int32_t ho = static_cast<int32_t>(n * p.Hq + hq);
-              for (int tile = 0; tile < direct_tiles; ++tile) {
-                int idx = base + out_lane * direct_tiles + tile;
+              for (int tile = sink_emit; tile < direct_tiles; ++tile) {
+                int idx = base + out_lane * band_direct + (tile - sink_emit);
                 complete_task_go[idx] = -ho - 1;
                 complete_task_tile[idx] = tile;
               }
@@ -1320,7 +1772,7 @@ __device__ void phase2_reduce_schedule(
           }
         }
       } else if (mode == kGroupModeFullFallback && p.full_fallback_group_direct != 0 &&
-                 p.group_size == 4) {
+                 group_direct_z2_supported(p)) {
         int base = atomicAdd(&task_counts[0], rect_tiles);
         for (int tile = 0; tile < rect_tiles; ++tile) {
           complete_task_go[base + tile] = static_cast<int32_t>(go);
@@ -1344,26 +1796,30 @@ __device__ void phase2_reduce_schedule(
           complete_task_tile[base + tile] = tile;
         }
       }
+      // Reduction operates on band tiles only; the few sink tiles are merged
+      // raw (after the cache write) so the stored entry can exclude them.
+      int sched_band_tiles =
+          rect_tiles - front_sink_tiles_for_group(p, mode, rect_end);
       if (mode != kGroupModeMacHit &&
-          rect_tiles > rect_reduce_threshold_for_counts(p, mode, task_counts)) {
+          sched_band_tiles > rect_reduce_threshold_for_counts(p, mode, task_counts)) {
         atomicAdd(&task_counts[3], 1);
         if (mode == kGroupModeFullFallback) {
           int reduce_chunk = clamp_reduce_chunk_to_workspace(
-              balanced_rect_reduce_chunk_for_mode(p, mode, task_counts), rect_tiles,
+              balanced_rect_reduce_chunk_for_mode(p, mode, task_counts), sched_band_tiles,
               p.max_tiles_reduce);
-          int reduced_tiles = ceil_div_i32(rect_tiles, reduce_chunk);
+          int reduced_tiles = ceil_div_i32(sched_band_tiles, reduce_chunk);
           atomicMax(&task_counts[7], reduced_tiles);
         } else if (mode == kGroupModeMixedFallback) {
           int reduce_chunk = clamp_reduce_chunk_to_workspace(
-              balanced_rect_reduce_chunk_for_mode(p, mode, task_counts), rect_tiles,
+              balanced_rect_reduce_chunk_for_mode(p, mode, task_counts), sched_band_tiles,
               p.max_tiles_reduce);
-          int reduced_tiles = ceil_div_i32(rect_tiles, reduce_chunk);
+          int reduced_tiles = ceil_div_i32(sched_band_tiles, reduce_chunk);
           atomicMax(&task_counts[8], reduced_tiles);
         }
       }
     }
 
-    if (tail_tiles > 0) {
+    if (tail_tiles > 0 && !tail_prepass_active(p)) {
       bool unfuse_sparse_tail = sparse_fallback_unfuse_tail_active(p, task_counts);
       if (mode == kGroupModeMacHit) {
         if (!unfuse_sparse_tail && p.fuse_hit_tail_in_merge &&
@@ -1434,13 +1890,16 @@ __device__ void phase_attention_tiles_compact(
     void* __restrict__ partial_o,
     float* __restrict__ partial_lse,
     int max_tiles,
-    bool tail_group_direct_z2_on) {
+    bool tail_group_direct_z2_on,
+    uint8_t* __restrict__ dyn_smem) {
   const int total = task_counts[IsTail ? 1 : 0];
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
-  __shared__ __nv_bfloat16 sh_k_stage[kMaxStageTokens * kHeadDim];
-  __shared__ __nv_bfloat16 sh_v_stage[kMaxStageTokens * kHeadDim];
-  __shared__ int sh_phys_stage[kMaxStageTokens];
+  // Carved from the shared pool (double-buffered; the preceding z2 producer
+  // used the same bytes, so re-converge the block before the first write).
+  __nv_bfloat16* sh_k_stage = reinterpret_cast<__nv_bfloat16*>(dyn_smem);
+  __nv_bfloat16* sh_v_stage = sh_k_stage + 2 * kMaxStageTokens * kHeadDim;
+  __syncthreads();
 
   for (int task = blockIdx.x; task < total; task += gridDim.x) {
     int encoded_task = task_go[task];
@@ -1466,20 +1925,26 @@ __device__ void phase_attention_tiles_compact(
     int n = static_cast<int>(go / p.Hkv);
     if constexpr (!IsTail) {
       if (group_mode[go] == kGroupModeFullFallback && p.full_fallback_group_direct != 0 &&
-          p.group_size == 4 && p.D == kHeadDim && blockDim.x == 128) {
+          group_direct_z2_supported(p)) {
         continue;
       }
     }
     int tiles = group_tiles[go];
     if (tile >= tiles) continue;
 
-    int group_tokens = group_end[go] - group_begin[go];
-    int tile_tokens = p.tile_tokens;
-    if constexpr (!IsTail) {
-      tile_tokens = producer_rect_tile_tokens_for(p, task_counts, group_mode[go], group_tokens);
+    int begin = 0;
+    int end = 0;
+    bool is_front_sink_tile = false;
+    if constexpr (IsTail) {
+      begin = group_begin[go] + tile * p.tail_tile_tokens;
+      end = min(begin + p.tail_tile_tokens, group_end[go]);
+    } else {
+      if (!complete_tile_bounds(p, task_counts, group_mode[go], group_begin[go],
+                                group_end[go], tile, begin, end,
+                                is_front_sink_tile)) {
+        continue;
+      }
     }
-    int begin = group_begin[go] + tile * tile_tokens;
-    int end = min(begin + tile_tokens, group_end[go]);
     int token_count = end - begin;
     if (token_count <= 0) continue;
     int req = req_ids[n];
@@ -1490,7 +1955,8 @@ __device__ void phase_attention_tiles_compact(
       tile_overlaps_head = false;
       if (warp < p.group_size) {
         int64_t ho = static_cast<int64_t>(n) * p.Hq + hq;
-        tile_overlaps_head = end > head_rect_start[ho] && begin < head_new_end[ho];
+        tile_overlaps_head =
+            rect_tile_overlaps_head(p, begin, end, head_rect_start[ho], head_new_end[ho]);
       }
     }
 
@@ -1511,26 +1977,46 @@ __device__ void phase_attention_tiles_compact(
       }
     }
 
-    for (int stage_begin = begin; stage_begin < end; stage_begin += p.stage_tokens) {
-      int stage_count = min(p.stage_tokens, end - stage_begin);
-      if (threadIdx.x < stage_count) {
-        int pos = stage_begin + threadIdx.x;
-        sh_phys_stage[threadIdx.x] = physical_token(
+    // Double-buffered cp_async staging: the copy of stage i+1 overlaps the
+    // softmax of stage i, so the per-stage global-memory latency is hidden
+    // instead of serialized behind two __syncthreads (this producer is the
+    // generic path for every GQA size, and the only staged one for GQA-8).
+    // Each thread copies whole 16B chunks: chunk c -> token s = c / 16,
+    // dims [(c % 16) * 8, +8); the issuing thread reads req_to_token itself
+    // (L1-resident), so no shared phys list or extra barrier is needed.
+    const int chunks_per_token = p.D / 8;  // 16 for D=128
+    auto issue_stage = [&](int stage_begin_i, int stage_count_i, int buf) {
+      int total_chunks = stage_count_i * chunks_per_token;
+      __nv_bfloat16* k_dst = sh_k_stage + buf * kMaxStageTokens * p.D;
+      __nv_bfloat16* v_dst = sh_v_stage + buf * kMaxStageTokens * p.D;
+      for (int c = threadIdx.x; c < total_chunks; c += blockDim.x) {
+        int s = c / chunks_per_token;
+        int d = (c - s * chunks_per_token) * 8;
+        int pos = stage_begin_i + s;
+        int phys = physical_token(
             n, req, pos, past_len, req_to_token, p.req_to_token_stride,
             out_cache_loc_i32, out_cache_loc_i64, p.out_cache_loc_is_i64);
-      }
-      __syncthreads();
-
-      int stage_elems = stage_count * p.D;
-      for (int idx = threadIdx.x; idx < stage_elems; idx += blockDim.x) {
-        int s = idx / p.D;
-        int d = idx - s * p.D;
-        int phys = sh_phys_stage[s];
         int64_t off = (static_cast<int64_t>(phys) * p.Hkv + hkv) * p.D + d;
-        sh_k_stage[idx] = k_buffer[off];
-        sh_v_stage[idx] = v_buffer[off];
+        cp_async_cg_16(&k_dst[s * p.D + d], &k_buffer[off]);
+        cp_async_cg_16(&v_dst[s * p.D + d], &v_buffer[off]);
       }
+      cp_async_commit();
+    };
+
+    int cur_buf = 0;
+    issue_stage(begin, min(p.stage_tokens, end - begin), cur_buf);
+
+    for (int stage_begin = begin; stage_begin < end; stage_begin += p.stage_tokens) {
+      int stage_count = min(p.stage_tokens, end - stage_begin);
+      int next_begin = stage_begin + p.stage_tokens;
+      // Wait for the current buffer, and (via the barrier) for every warp to
+      // be done with the buffer the next issue will overwrite.
+      cp_async_wait_group<0>();
       __syncthreads();
+      if (next_begin < end) {
+        issue_stage(next_begin, min(p.stage_tokens, end - next_begin), cur_buf ^ 1);
+      }
+      const int stage_off_base = cur_buf * kMaxStageTokens * p.D;
 
       for (int s = 0; s < stage_count; ++s) {
         int pos = stage_begin + s;
@@ -1538,12 +2024,13 @@ __device__ void phase_attention_tiles_compact(
         if constexpr (!IsTail) {
           if (contributes) {
             int64_t ho = static_cast<int64_t>(n) * p.Hq + hq;
-            contributes = pos >= head_rect_start[ho] && pos < head_new_end[ho];
+            contributes =
+                rect_pos_contributes_to_head(p, pos, head_rect_start[ho], head_new_end[ho]);
           }
         }
 
         if (contributes) {
-          const int stage_off = s * p.D;
+          const int stage_off = stage_off_base + s * p.D;
           float dot = 0.0f;
 #pragma unroll
           for (int i = 0; i < 4; ++i) {
@@ -1578,7 +2065,7 @@ __device__ void phase_attention_tiles_compact(
           has_value = true;
         }
       }
-      __syncthreads();
+      cur_buf ^= 1;
     }
 
     if (warp < p.group_size && tile_overlaps_head) {
@@ -1610,7 +2097,8 @@ __device__ void phase_attention_tiles_compact(
   }
 }
 
-__device__ void phase_complete_attention_group_direct_z2(
+template <int kGroup, int kZParts>
+__device__ void phase_complete_attention_group_direct_z2_impl(
     const Params& p,
     const __nv_bfloat16* __restrict__ q_post,
     const __nv_bfloat16* __restrict__ k_buffer,
@@ -1634,23 +2122,19 @@ __device__ void phase_complete_attention_group_direct_z2(
     float* __restrict__ partial_lse,
     int max_tiles,
     uint8_t* __restrict__ dyn_smem) {
-  if (p.full_fallback_group_direct == 0 || p.group_size != 4 || p.D != kHeadDim ||
-      blockDim.x != 128 || dyn_smem == nullptr) return;
-
-  constexpr int kGroup = kDirectZ2Group;
-  constexpr int kZParts = kDirectZ2ZParts;
-  constexpr int kStageTokens = kDirectZ2StageTokens;
+  constexpr int kStageTokens = kGroup * kZParts;
+  constexpr int kBufs = z2_pipeline_bufs(kStageTokens);
   const int tx = threadIdx.x & 15;
-  const int local = threadIdx.x >> 4;  // linearized (ty + group * tz)
-  const int ty = local & 3;
-  const int tz = (local >> 2) & 1;
+  const int local = threadIdx.x >> 4;  // linearized (ty + kGroup * tz)
+  const int ty = local % kGroup;
+  const int tz = local / kGroup;
   constexpr bool active_z = true;
   const unsigned subwarp_mask = (threadIdx.x & 16) ? 0xffff0000u : 0x0000ffffu;
   const int dim_base = tx * 8;
 
   __nv_bfloat16* sh_k = reinterpret_cast<__nv_bfloat16*>(dyn_smem);
-  __nv_bfloat16* sh_v = sh_k + 2 * kStageTokens * kHeadDim;
-  float* sh_o = reinterpret_cast<float*>(sh_v + 2 * kStageTokens * kHeadDim);
+  __nv_bfloat16* sh_v = sh_k + kBufs * kStageTokens * kHeadDim;
+  float* sh_o = reinterpret_cast<float*>(sh_v + kBufs * kStageTokens * kHeadDim);
   float* sh_lse = sh_o + kGroup * kZParts * kHeadDim;
 
   const int total = task_counts[0];
@@ -1680,20 +2164,28 @@ __device__ void phase_complete_attention_group_direct_z2(
     int tile = task_tile[task];
     int tiles = group_tiles[go];
     if (tile >= tiles) continue;
+    // The reducer consumes band tiles only, so the threshold must count band
+    // tiles (matching the scheduler's sched_band_tiles), not sink + band.
     bool keep_log2_for_fallback_reduce =
         mode == kGroupModeFullFallback && full_fallback_warp_reduce_enabled(p) &&
-        tiles > rect_reduce_threshold_for_counts(p, group_mode[go], task_counts);
+        (tiles - front_sink_tiles_for_group(p, mode, group_end[go])) >
+            rect_reduce_threshold_for_counts(p, group_mode[go], task_counts);
 
-    int group_tokens = group_end[go] - group_begin[go];
-    int tile_tokens = producer_rect_tile_tokens_for(p, task_counts, group_mode[go], group_tokens);
-    int begin = group_begin[go] + tile * tile_tokens;
-    int end = min(begin + tile_tokens, group_end[go]);
-    if (end <= begin) continue;
+    int begin = 0;
+    int end = 0;
+    bool is_front_sink_tile = false;
+    if (!complete_tile_bounds(p, task_counts, group_mode[go], group_begin[go],
+                              group_end[go], tile, begin, end, is_front_sink_tile)) {
+      continue;
+    }
+    // Sink tiles bypass the reducer and are merged raw (natural-log domain) by
+    // the phase4 output-only sink merge; never store them in log2 domain.
+    keep_log2_for_fallback_reduce = keep_log2_for_fallback_reduce && !is_front_sink_tile;
 
     int req = req_ids[n];
     int past_len = past_lens[n];
     int64_t req_token_base = static_cast<int64_t>(req) * p.req_to_token_stride;
-    int miss_lanes[kDirectZ2Group];
+    int miss_lanes[kGroup];
     int miss_heads = 0;
     int lanes_per_miss_head = 1;
     int miss_slot = ty;
@@ -1702,14 +2194,14 @@ __device__ void phase_complete_attention_group_direct_z2(
     int local_miss_part = 0;
     if (misspack_z2) {
 #pragma unroll
-      for (int lane_i = 0; lane_i < kDirectZ2Group; ++lane_i) {
+      for (int lane_i = 0; lane_i < kGroup; ++lane_i) {
         int hq_i = hkv * p.group_size + lane_i;
         int64_t ho_i = static_cast<int64_t>(n) * p.Hq + hq_i;
         if (lane_i < p.group_size && head_hit[ho_i] == 0) {
           miss_lanes[miss_heads++] = lane_i;
         }
       }
-      lanes_per_miss_head = miss_heads > 0 ? max(1, kDirectZ2Group / miss_heads) : 1;
+      lanes_per_miss_head = miss_heads > 0 ? max(1, kGroup / miss_heads) : 1;
       miss_slot = ty / lanes_per_miss_head;
       misspack_lane_active =
           miss_slot < miss_heads && ty < miss_heads * lanes_per_miss_head;
@@ -1721,7 +2213,8 @@ __device__ void phase_complete_attention_group_direct_z2(
     int head_begin = mixed_z2 ? head_rect_start[ho] : begin;
     int head_end = mixed_z2 ? head_new_end[ho] : end;
     bool tile_overlaps_head =
-        (!mixed_z2 || (end > head_begin && begin < head_end)) && misspack_lane_active;
+        (!mixed_z2 || rect_tile_overlaps_head(p, begin, end, head_begin, head_end)) &&
+        misspack_lane_active;
     const float score_scale = p.sm_scale * kLog2e;
 
     float q_vals[8];
@@ -1736,33 +2229,41 @@ __device__ void phase_complete_attention_group_direct_z2(
       q_vals[i] = bf16_to_float(q_post[(static_cast<int64_t>(n) * p.Hq + hq) * p.D + d]);
     }
 
-    int stage_begin = begin;
-    int stage_count = min(kStageTokens, end - stage_begin);
-    int cur_buf = 0;
-    int load_slot = tz * kGroup + ty;
-    if (active_z && load_slot < stage_count) {
-      int load_pos = stage_begin + load_slot;
-      int phys = req_to_token[req_token_base + load_pos];
-      int64_t off = (static_cast<int64_t>(phys) * p.Hkv + hkv) * p.D + dim_base;
-      int sh_off = cur_buf * kStageTokens * p.D + load_slot * p.D + dim_base;
-      cp_async_cg_16(&sh_k[sh_off], &k_buffer[off]);
-      cp_async_cg_16(&sh_v[sh_off], &v_buffer[off]);
-    }
-    cp_async_commit();
-    cp_async_wait_all();
-    z2_stage_half_sync(tz);
-
-    for (; stage_begin < end; stage_begin += kStageTokens) {
-      int next_begin = stage_begin + kStageTokens;
-      int next_count = min(kStageTokens, end - next_begin);
-      int next_buf = cur_buf ^ 1;
-      bool has_next = next_begin < end;
-      int load_slot = tz * kGroup + ty;
-      if (active_z && has_next && load_slot < next_count) {
-        int load_pos = next_begin + load_slot;
+    // cp_async ring: keep kBufs-1 stages in flight (one commit
+    // group per stage; threads with nothing to load still commit an empty
+    // group so per-thread group counts stay uniform for wait_group<N>).
+    const int load_slot = tz * kGroup + ty;
+    for (int i = 0; i < kBufs - 1; ++i) {
+      int sb = begin + i * kStageTokens;
+      int cnt = sb < end ? min(kStageTokens, end - sb) : 0;
+      if (active_z && load_slot < cnt) {
+        int load_pos = sb + load_slot;
         int phys = req_to_token[req_token_base + load_pos];
         int64_t off = (static_cast<int64_t>(phys) * p.Hkv + hkv) * p.D + dim_base;
-        int sh_off = next_buf * kStageTokens * p.D + load_slot * p.D + dim_base;
+        int sh_off = i * kStageTokens * p.D + load_slot * p.D + dim_base;
+        cp_async_cg_16(&sh_k[sh_off], &k_buffer[off]);
+        cp_async_cg_16(&sh_v[sh_off], &v_buffer[off]);
+      }
+      cp_async_commit();
+    }
+    cp_async_wait_group<kBufs - 2>();
+    z2_stage_part_sync<kGroup, kZParts>(tz);
+
+    int cur_buf = 0;
+    int stage_count = 0;
+    for (int stage_begin = begin; stage_begin < end; stage_begin += kStageTokens) {
+      stage_count = min(kStageTokens, end - stage_begin);
+      int pre_begin = stage_begin + (kBufs - 1) * kStageTokens;
+      int pre_count = pre_begin < end ? min(kStageTokens, end - pre_begin) : 0;
+      int pre_buf = cur_buf + (kBufs - 1);
+      if (pre_buf >= kBufs) pre_buf -= kBufs;
+      // pre_buf was computed in the PREVIOUS iteration; the part sync at its
+      // end orders that compute before this overwrite.
+      if (active_z && load_slot < pre_count) {
+        int load_pos = pre_begin + load_slot;
+        int phys = req_to_token[req_token_base + load_pos];
+        int64_t off = (static_cast<int64_t>(phys) * p.Hkv + hkv) * p.D + dim_base;
+        int sh_off = pre_buf * kStageTokens * p.D + load_slot * p.D + dim_base;
         cp_async_cg_16(&sh_k[sh_off], &k_buffer[off]);
         cp_async_cg_16(&sh_v[sh_off], &v_buffer[off]);
       }
@@ -1847,7 +2348,8 @@ __device__ void phase_complete_attention_group_direct_z2(
              j += lanes_per_miss_head) {
           int slot = tz * kGroup + j;
           int pos = stage_begin + slot;
-          bool contributes = tile_overlaps_head && pos >= head_begin && pos < head_end;
+          bool contributes =
+              tile_overlaps_head && rect_pos_contributes_to_head(p, pos, head_begin, head_end);
           if (contributes) {
             float dot = 0.0f;
             int sh_off = cur_buf * kStageTokens * p.D + slot * p.D + dim_base;
@@ -1877,7 +2379,8 @@ __device__ void phase_complete_attention_group_direct_z2(
           int slot = tz * kGroup + j;
           int pos = stage_begin + slot;
           bool contributes =
-              tile_overlaps_head && slot < stage_count && pos >= head_begin && pos < head_end;
+              tile_overlaps_head && slot < stage_count &&
+              rect_pos_contributes_to_head(p, pos, head_begin, head_end);
           if (contributes) {
             float dot = 0.0f;
             int sh_off = cur_buf * kStageTokens * p.D + slot * p.D + dim_base;
@@ -1907,7 +2410,8 @@ __device__ void phase_complete_attention_group_direct_z2(
           int slot = tz * kGroup + j;
           int pos = stage_begin + slot;
           bool contributes =
-              tile_overlaps_head && (!mixed_z2 || (pos >= head_begin && pos < head_end));
+              tile_overlaps_head &&
+              (!mixed_z2 || rect_pos_contributes_to_head(p, pos, head_begin, head_end));
           if (contributes) {
             float dot = 0.0f;
             int sh_off = cur_buf * kStageTokens * p.D + slot * p.D + dim_base;
@@ -1938,7 +2442,7 @@ __device__ void phase_complete_attention_group_direct_z2(
           int pos = stage_begin + slot;
           bool contributes =
               tile_overlaps_head && slot < stage_count &&
-              (!mixed_z2 || (pos >= head_begin && pos < head_end));
+              (!mixed_z2 || rect_pos_contributes_to_head(p, pos, head_begin, head_end));
           if (contributes) {
             float dot = 0.0f;
             int sh_off = cur_buf * kStageTokens * p.D + slot * p.D + dim_base;
@@ -1963,12 +2467,10 @@ __device__ void phase_complete_attention_group_direct_z2(
           }
         }
       }
-      if (has_next) {
-        cp_async_wait_all();
-      }
-      z2_stage_half_sync(tz);
-      cur_buf = next_buf;
-      stage_count = next_count;
+      cp_async_wait_group<kBufs - 2>();
+      z2_stage_part_sync<kGroup, kZParts>(tz);
+      cur_buf += 1;
+      if (cur_buf >= kBufs) cur_buf = 0;
     }
 
     int state = ty * kZParts + tz;
@@ -2104,7 +2606,52 @@ __device__ void phase_complete_attention_group_direct_z2(
   }
 }
 
-__device__ void phase_tail_attention_group_direct_z2(
+template <int BlockThreads>
+__device__ void phase_complete_attention_group_direct_z2(
+    const Params& p,
+    const __nv_bfloat16* __restrict__ q_post,
+    const __nv_bfloat16* __restrict__ k_buffer,
+    const __nv_bfloat16* __restrict__ v_buffer,
+    const int32_t* __restrict__ req_to_token,
+    const int32_t* __restrict__ req_ids,
+    const int32_t* __restrict__ past_lens,
+    const int32_t* __restrict__ out_cache_loc_i32,
+    const int64_t* __restrict__ out_cache_loc_i64,
+    const int32_t* __restrict__ group_begin,
+    const int32_t* __restrict__ group_end,
+    const int32_t* __restrict__ group_tiles,
+    const int32_t* __restrict__ group_mode,
+    const int32_t* __restrict__ head_hit,
+    const int32_t* __restrict__ head_rect_start,
+    const int32_t* __restrict__ head_new_end,
+    const int32_t* __restrict__ task_go,
+    const int32_t* __restrict__ task_tile,
+    const int32_t* __restrict__ task_counts,
+    void* __restrict__ partial_o,
+    float* __restrict__ partial_lse,
+    int max_tiles,
+    uint8_t* __restrict__ dyn_smem) {
+  if (p.full_fallback_group_direct == 0 || dyn_smem == nullptr) return;
+  if (z2_parts_for_config(BlockThreads, p.group_size, p.D) == 0) return;
+#define MAC_Z2_COMPLETE_ARGS                                                      \
+  p, q_post, k_buffer, v_buffer, req_to_token, req_ids, past_lens,                \
+      out_cache_loc_i32, out_cache_loc_i64, group_begin, group_end, group_tiles,  \
+      group_mode, head_hit, head_rect_start, head_new_end, task_go, task_tile,    \
+      task_counts, partial_o, partial_lse, max_tiles, dyn_smem
+  if constexpr (BlockThreads == 128) {
+    if (p.group_size == 4) {
+      phase_complete_attention_group_direct_z2_impl<4, 2>(MAC_Z2_COMPLETE_ARGS);
+    }
+  } else {
+    if (p.group_size == 8) {
+      phase_complete_attention_group_direct_z2_impl<8, 2>(MAC_Z2_COMPLETE_ARGS);
+    }
+  }
+#undef MAC_Z2_COMPLETE_ARGS
+}
+
+template <int kGroup, int kZParts>
+__device__ void phase_tail_attention_group_direct_z2_impl(
     const Params& p,
     const __nv_bfloat16* __restrict__ q_post,
     const __nv_bfloat16* __restrict__ k_buffer,
@@ -2125,40 +2672,61 @@ __device__ void phase_tail_attention_group_direct_z2(
     float* __restrict__ partial_lse,
     int max_tiles,
     uint8_t* __restrict__ dyn_smem,
-    bool tail_group_direct_z2_on) {
-  if (!tail_group_direct_z2_on || dyn_smem == nullptr) {
-    return;
-  }
-
-  constexpr int kGroup = kDirectZ2Group;
-  constexpr int kZParts = kDirectZ2ZParts;
-  constexpr int kStageTokens = kDirectZ2StageTokens;
+    bool prepass) {
+  constexpr int kStageTokens = kGroup * kZParts;
+  constexpr int kBufs = z2_pipeline_bufs(kStageTokens);
   const int tx = threadIdx.x & 15;
   const int local = threadIdx.x >> 4;
-  const int ty = local & 3;
-  const int tz = (local >> 2) & 1;
+  const int ty = local % kGroup;
+  const int tz = local / kGroup;
   const unsigned subwarp_mask = (threadIdx.x & 16) ? 0xffff0000u : 0x0000ffffu;
   const int dim_base = tx * 8;
 
   __nv_bfloat16* sh_k = reinterpret_cast<__nv_bfloat16*>(dyn_smem);
-  __nv_bfloat16* sh_v = sh_k + 2 * kStageTokens * kHeadDim;
-  float* sh_o = reinterpret_cast<float*>(sh_v + 2 * kStageTokens * kHeadDim);
+  __nv_bfloat16* sh_v = sh_k + kBufs * kStageTokens * kHeadDim;
+  float* sh_o = reinterpret_cast<float*>(sh_v + kBufs * kStageTokens * kHeadDim);
   float* sh_lse = sh_o + kGroup * kZParts * kHeadDim;
 
-  const int total = task_counts[1];
   const int group_total = p.N * p.Hkv;
+  // Prepass mode: schedule-free flat (group, tile) index space; the bounds
+  // math matches group_tail_begin/end exactly (both derive from past_len).
+  int tiles_pg = 1;
+  if (prepass) {
+    tiles_pg = p.semantic_pos_ahead > 0
+                   ? ceil_div_i32(p.semantic_pos_ahead, p.tail_tile_tokens)
+                   : 1;
+    if (tiles_pg < 1) tiles_pg = 1;
+  }
+  const int total = prepass ? group_total * tiles_pg : task_counts[1];
   for (int task = blockIdx.x; task < total; task += gridDim.x) {
-    int encoded_task = task_go[task];
-    if (encoded_task < 0 || encoded_task >= group_total) continue;
-    int64_t go = static_cast<int64_t>(encoded_task);
-    int tile = task_tile[task];
-    int tiles = group_tiles[go];
-    if (tile >= tiles) continue;
-
-    int hkv = static_cast<int>(go % p.Hkv);
-    int n = static_cast<int>(go / p.Hkv);
-    int begin = group_begin[go] + tile * p.tile_tokens;
-    int end = min(begin + p.tile_tokens, group_end[go]);
+    int64_t go;
+    int tile;
+    int begin;
+    int end;
+    int hkv;
+    int n;
+    if (prepass) {
+      go = task / tiles_pg;
+      tile = task % tiles_pg;
+      hkv = static_cast<int>(go % p.Hkv);
+      n = static_cast<int>(go / p.Hkv);
+      int past_len_i = past_lens[n];
+      int kv_len = past_len_i + 1;
+      int tail_begin = cache_end_for_pos(past_len_i, p.semantic_pos_ahead);
+      begin = tail_begin + tile * p.tail_tile_tokens;
+      end = min(begin + p.tail_tile_tokens, kv_len);
+    } else {
+      int encoded_task = task_go[task];
+      if (encoded_task < 0 || encoded_task >= group_total) continue;
+      go = static_cast<int64_t>(encoded_task);
+      tile = task_tile[task];
+      int tiles = group_tiles[go];
+      if (tile >= tiles) continue;
+      hkv = static_cast<int>(go % p.Hkv);
+      n = static_cast<int>(go / p.Hkv);
+      begin = group_begin[go] + tile * p.tail_tile_tokens;
+      end = min(begin + p.tail_tile_tokens, group_end[go]);
+    }
     if (end <= begin) continue;
 
     int req = req_ids[n];
@@ -2178,37 +2746,41 @@ __device__ void phase_tail_attention_group_direct_z2(
       q_vals[i] = bf16_to_float(q_post[(static_cast<int64_t>(n) * p.Hq + hq) * p.D + d]);
     }
 
-    int stage_begin = begin;
-    int stage_count = min(kStageTokens, end - stage_begin);
-    int cur_buf = 0;
-    int load_slot = tz * kGroup + ty;
-    if (load_slot < stage_count) {
-      int load_pos = stage_begin + load_slot;
-      int phys = physical_token(n, req, load_pos, past_len, req_to_token, p.req_to_token_stride,
-                                out_cache_loc_i32, out_cache_loc_i64,
-                                p.out_cache_loc_is_i64);
-      int64_t off = (static_cast<int64_t>(phys) * p.Hkv + hkv) * p.D + dim_base;
-      int sh_off = cur_buf * kStageTokens * p.D + load_slot * p.D + dim_base;
-      cp_async_cg_16(&sh_k[sh_off], &k_buffer[off]);
-      cp_async_cg_16(&sh_v[sh_off], &v_buffer[off]);
-    }
-    cp_async_commit();
-    cp_async_wait_all();
-    z2_stage_half_sync(tz);
-
-    for (; stage_begin < end; stage_begin += kStageTokens) {
-      int next_begin = stage_begin + kStageTokens;
-      int next_count = min(kStageTokens, end - next_begin);
-      int next_buf = cur_buf ^ 1;
-      bool has_next = next_begin < end;
-      int load_slot_next = tz * kGroup + ty;
-      if (has_next && load_slot_next < next_count) {
-        int load_pos = next_begin + load_slot_next;
+    // cp_async ring, same structure as the complete producer (see there).
+    const int load_slot = tz * kGroup + ty;
+    for (int i = 0; i < kBufs - 1; ++i) {
+      int sb = begin + i * kStageTokens;
+      int cnt = sb < end ? min(kStageTokens, end - sb) : 0;
+      if (load_slot < cnt) {
+        int load_pos = sb + load_slot;
         int phys = physical_token(n, req, load_pos, past_len, req_to_token,
                                   p.req_to_token_stride, out_cache_loc_i32,
                                   out_cache_loc_i64, p.out_cache_loc_is_i64);
         int64_t off = (static_cast<int64_t>(phys) * p.Hkv + hkv) * p.D + dim_base;
-        int sh_off = next_buf * kStageTokens * p.D + load_slot_next * p.D + dim_base;
+        int sh_off = i * kStageTokens * p.D + load_slot * p.D + dim_base;
+        cp_async_cg_16(&sh_k[sh_off], &k_buffer[off]);
+        cp_async_cg_16(&sh_v[sh_off], &v_buffer[off]);
+      }
+      cp_async_commit();
+    }
+    cp_async_wait_group<kBufs - 2>();
+    z2_stage_part_sync<kGroup, kZParts>(tz);
+
+    int cur_buf = 0;
+    int stage_count = 0;
+    for (int stage_begin = begin; stage_begin < end; stage_begin += kStageTokens) {
+      stage_count = min(kStageTokens, end - stage_begin);
+      int pre_begin = stage_begin + (kBufs - 1) * kStageTokens;
+      int pre_count = pre_begin < end ? min(kStageTokens, end - pre_begin) : 0;
+      int pre_buf = cur_buf + (kBufs - 1);
+      if (pre_buf >= kBufs) pre_buf -= kBufs;
+      if (load_slot < pre_count) {
+        int load_pos = pre_begin + load_slot;
+        int phys = physical_token(n, req, load_pos, past_len, req_to_token,
+                                  p.req_to_token_stride, out_cache_loc_i32,
+                                  out_cache_loc_i64, p.out_cache_loc_is_i64);
+        int64_t off = (static_cast<int64_t>(phys) * p.Hkv + hkv) * p.D + dim_base;
+        int sh_off = pre_buf * kStageTokens * p.D + load_slot * p.D + dim_base;
         cp_async_cg_16(&sh_k[sh_off], &k_buffer[off]);
         cp_async_cg_16(&sh_v[sh_off], &v_buffer[off]);
       }
@@ -2267,12 +2839,10 @@ __device__ void phase_tail_attention_group_direct_z2(
           }
         }
       }
-      if (has_next) {
-        cp_async_wait_all();
-      }
-      z2_stage_half_sync(tz);
-      cur_buf = next_buf;
-      stage_count = next_count;
+      cp_async_wait_group<kBufs - 2>();
+      z2_stage_part_sync<kGroup, kZParts>(tz);
+      cur_buf += 1;
+      if (cur_buf >= kBufs) cur_buf = 0;
     }
 
     int state = ty * kZParts + tz;
@@ -2335,6 +2905,54 @@ __device__ void phase_tail_attention_group_direct_z2(
   }
 }
 
+template <int BlockThreads>
+__device__ void phase_tail_attention_group_direct_z2(
+    const Params& p,
+    const __nv_bfloat16* __restrict__ q_post,
+    const __nv_bfloat16* __restrict__ k_buffer,
+    const __nv_bfloat16* __restrict__ v_buffer,
+    const int32_t* __restrict__ req_to_token,
+    const int32_t* __restrict__ req_ids,
+    const int32_t* __restrict__ past_lens,
+    const int32_t* __restrict__ out_cache_loc_i32,
+    const int64_t* __restrict__ out_cache_loc_i64,
+    const int32_t* __restrict__ group_begin,
+    const int32_t* __restrict__ group_end,
+    const int32_t* __restrict__ group_tiles,
+    const int32_t* __restrict__ group_mode,
+    const int32_t* __restrict__ task_go,
+    const int32_t* __restrict__ task_tile,
+    const int32_t* __restrict__ task_counts,
+    void* __restrict__ partial_o,
+    float* __restrict__ partial_lse,
+    int max_tiles,
+    uint8_t* __restrict__ dyn_smem,
+    bool tail_group_direct_z2_on,
+    bool prepass) {
+  if (dyn_smem == nullptr) return;
+  if (prepass) {
+    if (!tail_prepass_active(p)) return;
+  } else if (!tail_group_direct_z2_on) {
+    return;
+  }
+  if (z2_parts_for_config(BlockThreads, p.group_size, p.D) == 0) return;
+#define MAC_Z2_TAIL_ARGS                                                          \
+  p, q_post, k_buffer, v_buffer, req_to_token, req_ids, past_lens,                \
+      out_cache_loc_i32, out_cache_loc_i64, group_begin, group_end, group_tiles,  \
+      group_mode, task_go, task_tile, task_counts, partial_o, partial_lse,        \
+      max_tiles, dyn_smem, prepass
+  if constexpr (BlockThreads == 128) {
+    if (p.group_size == 4) {
+      phase_tail_attention_group_direct_z2_impl<4, 2>(MAC_Z2_TAIL_ARGS);
+    }
+  } else {
+    if (p.group_size == 8) {
+      phase_tail_attention_group_direct_z2_impl<8, 2>(MAC_Z2_TAIL_ARGS);
+    }
+  }
+#undef MAC_Z2_TAIL_ARGS
+}
+
 __device__ void phase_complete_attention_head_direct(
     const Params& p,
     const __nv_bfloat16* __restrict__ q_post,
@@ -2377,13 +2995,20 @@ __device__ void phase_complete_attention_head_direct(
     int tiles = group_tiles[go];
     if (tile >= tiles) continue;
 
-    int group_tokens = group_end[go] - group_begin[go];
-    int tile_tokens = producer_rect_tile_tokens_for(p, task_counts, group_mode[go], group_tokens);
-    int begin = group_begin[go] + tile * tile_tokens;
-    int end = min(begin + tile_tokens, group_end[go]);
+    int begin = 0;
+    int end = 0;
+    bool is_front_sink_tile = false;
+    if (!complete_tile_bounds(p, task_counts, group_mode[go], group_begin[go],
+                              group_end[go], tile, begin, end, is_front_sink_tile)) {
+      continue;
+    }
     int64_t ho = static_cast<int64_t>(n) * p.Hq + hq;
-    begin = max(begin, head_rect_start[ho]);
-    end = min(end, head_new_end[ho]);
+    if (is_front_sink_tile) {
+      end = min(end, head_front_sink_end(p, head_rect_start[ho], head_new_end[ho]));
+    } else {
+      begin = max(begin, head_rect_start[ho]);
+      end = min(end, head_new_end[ho]);
+    }
     if (end <= begin) continue;
 
     int req = req_ids[n];
@@ -2463,7 +3088,9 @@ __device__ void phase_all_hit_complete_direct(
     void* __restrict__ partial_o,
     float* __restrict__ partial_lse,
     int max_tiles) {
-  const int max_hit_tiles = min(max_tiles, ceil_div_i32(max(p.M, 1), p.tile_tokens));
+  const int max_hit_tiles =
+      min(max_tiles, ceil_div_i32(max(p.M, 1), p.tile_tokens) +
+                         ceil_div_i32(max(p.front_sink_tokens, 0), p.tile_tokens));
   const int total = p.N * p.Hkv * max_hit_tiles;
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
@@ -2479,16 +3106,21 @@ __device__ void phase_all_hit_complete_direct(
     int tiles = group_tiles[go];
     if (tile >= tiles) continue;
 
-    int begin = group_begin[go] + tile * p.tile_tokens;
-    int end = min(begin + p.tile_tokens, group_end[go]);
-    if (end <= begin) continue;
+    int begin = 0;
+    int end = 0;
+    bool is_front_sink_tile = false;
+    if (!complete_tile_bounds(p, nullptr, group_mode[go], group_begin[go],
+                              group_end[go], tile, begin, end, is_front_sink_tile)) {
+      continue;
+    }
     int req = req_ids[n];
     int past_len = past_lens[n];
     int hq = hkv * p.group_size + warp;
     bool tile_overlaps_head = false;
     if (warp < p.group_size) {
       int64_t ho = static_cast<int64_t>(n) * p.Hq + hq;
-      tile_overlaps_head = end > head_rect_start[ho] && begin < head_new_end[ho];
+      tile_overlaps_head =
+          rect_tile_overlaps_head(p, begin, end, head_rect_start[ho], head_new_end[ho]);
     }
 
     float m = -kInf;
@@ -2522,7 +3154,8 @@ __device__ void phase_all_hit_complete_direct(
       bool contributes = false;
       if (warp < p.group_size) {
         int64_t ho = static_cast<int64_t>(n) * p.Hq + hq;
-        contributes = pos >= head_rect_start[ho] && pos < head_new_end[ho];
+        contributes =
+            rect_pos_contributes_to_head(p, pos, head_rect_start[ho], head_new_end[ho]);
       }
       if (contributes) {
         float dot = 0.0f;
@@ -2605,8 +3238,8 @@ __device__ void phase_tail_attention_head_direct(
     int hkv = hq / p.group_size;
     int lane_id = hq - hkv * p.group_size;
     int64_t go = static_cast<int64_t>(n) * p.Hkv + hkv;
-    int begin = group_tail_begin[go] + tile * p.tile_tokens;
-    int end = min(begin + p.tile_tokens, group_tail_end[go]);
+    int begin = group_tail_begin[go] + tile * p.tail_tile_tokens;
+    int end = min(begin + p.tail_tile_tokens, group_tail_end[go]);
     if (end <= begin) continue;
 
     int req = req_ids[n];
@@ -2713,8 +3346,8 @@ __device__ void phase_all_hit_tail_direct(
     int tail_tiles = group_tail_tiles[go];
     if (tile >= tail_tiles) continue;
 
-    int begin = group_tail_begin[go] + tile * p.tile_tokens;
-    int end = min(begin + p.tile_tokens, group_tail_end[go]);
+    int begin = group_tail_begin[go] + tile * p.tail_tile_tokens;
+    int end = min(begin + p.tail_tile_tokens, group_tail_end[go]);
     if (end <= begin) continue;
 
     int req = req_ids[n];
@@ -2849,6 +3482,11 @@ __device__ void phase_reduce_full_fallback_rect(
     int tile_begin = chunk * reduce_chunk;
     int tile_end = min(tile_begin + reduce_chunk, orig_tiles);
     int group_begin = per_head_rect ? head_begin : group_rect_begin[go];
+    // Band tiles sit physically after the group's front-sink tiles; the sink
+    // tiles are excluded from reduction (merged raw after the cache write).
+    int sink_tiles_total =
+        per_head_rect ? 0
+                      : front_sink_tiles_for_group(p, group_mode[go], group_rect_end[go]);
     int dim = threadIdx.x;
     bool owns_dim = dim < p.D;
     float acc = 0.0f;
@@ -2864,10 +3502,11 @@ __device__ void phase_reduce_full_fallback_rect(
     for (int tile = tile_begin; tile < tile_end; ++tile) {
       int begin = group_begin + tile * tile_tokens;
       int end = min(begin + tile_tokens, group_rect_end[go]);
-      if (end <= head_begin || begin >= head_end) {
+      if (!rect_tile_overlaps_head(p, begin, end, head_begin, head_end)) {
         continue;
       }
-      int64_t lse_off = (((static_cast<int64_t>(n) * p.Hkv + hkv) * p.max_tiles_context + tile) *
+      int64_t lse_off = (((static_cast<int64_t>(n) * p.Hkv + hkv) * p.max_tiles_context +
+                          (sink_tiles_total + tile)) *
                          p.group_size + lane_id);
       if (threadIdx.x == 0) {
         float w_state = 1.0f, w_other = 0.0f;
@@ -2925,7 +3564,7 @@ __device__ void phase_reduce_full_fallback_group_warp(
 
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
-  if (warp >= p.group_size) return;
+  const int warps = static_cast<int>(blockDim.x) >> 5;
   const unsigned mask = 0xffffffffu;
   const int max_reduce_chunks =
       max_rect_reduce_chunks_for_mode(p, kGroupModeFullFallback, task_counts);
@@ -2954,6 +3593,13 @@ __device__ void phase_reduce_full_fallback_group_warp(
 
     int tile_begin = chunk * reduce_chunk;
     int tile_end = min(tile_begin + reduce_chunk, orig_tiles);
+    // Band tiles sit physically after the group's front-sink tiles; sink tiles
+    // are excluded from reduction (merged raw after the cache write).
+    int sink_tiles_total =
+        front_sink_tiles_for_group(p, group_mode[go], group_rect_end[go]);
+    // One warp per head lane; group sizes above the warp count wrap around
+    // (e.g. group 16 on a 256-thread block reduces two heads per warp).
+    for (int lane_hd = warp; lane_hd < p.group_size; lane_hd += warps) {
     int dims[4];
     float acc[4];
 #pragma unroll
@@ -2967,8 +3613,9 @@ __device__ void phase_reduce_full_fallback_group_warp(
 
     for (int tile = tile_begin; tile < tile_end; ++tile) {
       int64_t lse_off =
-          (((static_cast<int64_t>(n) * p.Hkv + hkv) * p.max_tiles_context + tile) *
-           p.group_size + warp);
+          (((static_cast<int64_t>(n) * p.Hkv + hkv) * p.max_tiles_context +
+            (sink_tiles_total + tile)) *
+           p.group_size + lane_hd);
       int other_valid_i = 0;
       float scale_state = 1.0f;
       float scale_other = 0.0f;
@@ -3011,7 +3658,7 @@ __device__ void phase_reduce_full_fallback_group_warp(
 
     int64_t reduced_lse_off =
         (((static_cast<int64_t>(n) * p.Hkv + hkv) * p.max_tiles_reduce + chunk) *
-         p.group_size + warp);
+         p.group_size + lane_hd);
     if (lane == 0) {
       partial_rect_reduced_lse[reduced_lse_off] =
           state_valid ? (state_m_log2 + log2f(state_d)) * kLn2 : -kInf;
@@ -3023,9 +3670,11 @@ __device__ void phase_reduce_full_fallback_group_warp(
       store_partial_o(partial_rect_reduced_o, reduced_lse_off * p.D + d,
                       state_valid ? acc[i] * inv_d : 0.0f, p.partial_o_bf16);
     }
+    }
   }
 }
 
+template <int BlockThreads>
 __device__ void phase_reduce_full_fallback_head_vec(
     const Params& p,
     const int32_t* __restrict__ group_mode,
@@ -3036,19 +3685,22 @@ __device__ void phase_reduce_full_fallback_head_vec(
     const void* __restrict__ partial_rect_o,
     const float* __restrict__ partial_rect_lse,
     void* __restrict__ partial_rect_reduced_o,
-    float* __restrict__ partial_rect_reduced_lse) {
+    float* __restrict__ partial_rect_reduced_lse,
+    uint8_t* __restrict__ dyn_smem) {
   if (!full_fallback_head_reduce_enabled(p)) return;
 
   constexpr int kBdx = 16;
-  constexpr int kBdy = 8;
+  // Row count covers the whole block so every thread reaches the per-task
+  // __syncthreads() below (an early return here would desync the block from
+  // the next pool-using phase).
+  constexpr int kBdy = BlockThreads / 16;
   constexpr int kVec = 8;
   const int tx = threadIdx.x & (kBdx - 1);
   const int ty = threadIdx.x >> 4;
-  if (ty >= kBdy) return;
 
-  __shared__ float sh_o[kBdy * kHeadDim];
-  __shared__ float sh_m[kBdy];
-  __shared__ float sh_d[kBdy];
+  float* sh_o = reinterpret_cast<float*>(dyn_smem);
+  float* sh_m = sh_o + kBdy * kHeadDim;
+  float* sh_d = sh_m + kBdy;
 
   const int max_reduce_chunks =
       max_rect_reduce_chunks_for_mode(p, kGroupModeFullFallback, task_counts);
@@ -3078,6 +3730,10 @@ __device__ void phase_reduce_full_fallback_head_vec(
 
     int tile_begin = chunk * reduce_chunk;
     int tile_end = min(tile_begin + reduce_chunk, orig_tiles);
+    // Band tiles sit physically after the group's front-sink tiles; sink tiles
+    // are excluded from reduction (merged raw after the cache write).
+    int sink_tiles_total =
+        front_sink_tiles_for_group(p, group_mode[go], group_rect_end[go]);
     int dim_base = tx * kVec;
 
     float local_o[kVec];
@@ -3091,7 +3747,8 @@ __device__ void phase_reduce_full_fallback_head_vec(
 
     for (int tile = tile_begin + ty; tile < tile_end; tile += kBdy) {
       int64_t lse_off =
-          (((static_cast<int64_t>(n) * p.Hkv + hkv) * p.max_tiles_context + tile) *
+          (((static_cast<int64_t>(n) * p.Hkv + hkv) * p.max_tiles_context +
+            (sink_tiles_total + tile)) *
            p.group_size + lane_id);
       float other_lse = partial_rect_lse[lse_off];
       if (!isfinite(other_lse)) continue;
@@ -3191,6 +3848,7 @@ __device__ void phase_reduce_full_fallback_head_vec(
   }
 }
 
+template <int BlockThreads>
 __device__ void phase_reduce_mixed_rect_head_vec(
     const Params& p,
     const int32_t* __restrict__ group_mode,
@@ -3203,19 +3861,20 @@ __device__ void phase_reduce_mixed_rect_head_vec(
     const void* __restrict__ partial_rect_o,
     const float* __restrict__ partial_rect_lse,
     void* __restrict__ partial_rect_reduced_o,
-    float* __restrict__ partial_rect_reduced_lse) {
+    float* __restrict__ partial_rect_reduced_lse,
+    uint8_t* __restrict__ dyn_smem) {
   if (!mixed_head_reduce_enabled(p)) return;
 
   constexpr int kBdx = 16;
-  constexpr int kBdy = 8;
+  // Whole-block row coverage; see phase_reduce_full_fallback_head_vec.
+  constexpr int kBdy = BlockThreads / 16;
   constexpr int kVec = 8;
   const int tx = threadIdx.x & (kBdx - 1);
   const int ty = threadIdx.x >> 4;
-  if (ty >= kBdy) return;
 
-  __shared__ float sh_o[kBdy * kHeadDim];
-  __shared__ float sh_m[kBdy];
-  __shared__ float sh_d[kBdy];
+  float* sh_o = reinterpret_cast<float*>(dyn_smem);
+  float* sh_m = sh_o + kBdy * kHeadDim;
+  float* sh_d = sh_m + kBdy;
 
   const int max_reduce_chunks =
       (task_counts != nullptr && task_counts[8] > 0) ? task_counts[8] : 0;
@@ -3255,7 +3914,9 @@ __device__ void phase_reduce_mixed_rect_head_vec(
     int tile_end = min(tile_begin + reduce_chunk, orig_tiles);
     int chunk_begin_pos = group_begin + tile_begin * tile_tokens;
     int chunk_end_pos = min(group_begin + tile_end * tile_tokens, group_end);
-    if (chunk_end_pos <= head_begin || chunk_begin_pos >= head_end) continue;
+    if (!rect_tile_overlaps_head(p, chunk_begin_pos, chunk_end_pos, head_begin, head_end)) {
+      continue;
+    }
 
     int dim_base = tx * kVec;
     float local_o[kVec];
@@ -3270,9 +3931,11 @@ __device__ void phase_reduce_mixed_rect_head_vec(
     for (int tile = tile_begin + ty; tile < tile_end; tile += kBdy) {
       int begin = group_begin + tile * tile_tokens;
       int end = min(begin + tile_tokens, group_end);
-      if (end <= head_begin || begin >= head_end) continue;
+      if (!rect_tile_overlaps_head(p, begin, end, head_begin, head_end)) continue;
+      // Physical band tiles are offset by the group's front-sink tiles.
       int64_t lse_off =
-          (((static_cast<int64_t>(n) * p.Hkv + hkv) * p.max_tiles_context + tile) *
+          (((static_cast<int64_t>(n) * p.Hkv + hkv) * p.max_tiles_context +
+            (front_sink_tiles_for_group(p, group_mode[go], group_end) + tile)) *
            p.group_size + lane_id);
       float other_lse = partial_rect_lse[lse_off];
       if (!isfinite(other_lse)) continue;
@@ -3496,17 +4159,20 @@ __device__ void phase_merge_full_fallback_group(
 
     float cache_lse = state_lse;
     bool cache_valid = state_valid;
+    // Not-ready requests (graph replay while the prefill offload is still
+    // populating this request's rows) must not touch any cache row.
+    const bool cache_row_writable = request_persistent_ready(p, req);
     int64_t q_cache_base = (((static_cast<int64_t>(req) * p.M + dest_slot) * p.Hq + hq) * p.D);
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       int d = dims[i];
-      if (d < p.D) {
+      if (d < p.D && cache_row_writable) {
         query_cache[q_cache_base + d] =
             q_pre[(static_cast<int64_t>(n) * p.Hq + hq) * p.D + d];
         attn_cache[q_cache_base + d] = cache_valid ? float_to_bf16(acc[i]) : float_to_bf16(0.0f);
       }
     }
-    if (lane == 0) {
+    if (lane == 0 && cache_row_writable) {
       lse_cache[(static_cast<int64_t>(req) * p.M + dest_slot) * p.Hq + hq] =
           cache_valid ? cache_lse : -kInf;
     }
@@ -3524,8 +4190,8 @@ __device__ void phase_merge_full_fallback_group(
     int tail_begin_base = group_tail_begin[go];
     int tail_end_all = group_tail_end[go];
     for (int tile = 0; tile < tail_tiles; ++tile) {
-        int begin = tail_begin_base + tile * p.tile_tokens;
-        int end = min(begin + p.tile_tokens, tail_end_all);
+        int begin = tail_begin_base + tile * p.tail_tile_tokens;
+        int end = min(begin + p.tail_tile_tokens, tail_end_all);
         float tile_m = -kInf;
         float tile_denom = 0.0f;
         bool tile_valid = false;
@@ -3644,7 +4310,8 @@ __device__ void phase4_merge_write(
     const void* __restrict__ partial_rect_reduced_o,
     const float* __restrict__ partial_rect_reduced_lse,
     const void* __restrict__ partial_tail_o,
-    const float* __restrict__ partial_tail_lse) {
+    const float* __restrict__ partial_tail_lse,
+    uint8_t* __restrict__ dyn_smem) {
   const int total = p.N * p.Hq;
   __shared__ float sh_lse;
   __shared__ bool sh_valid;
@@ -3652,8 +4319,8 @@ __device__ void phase4_merge_write(
   __shared__ float sh_w_other;
   __shared__ bool sh_take_other;
   __shared__ bool sh_other_valid;
-  __shared__ float sh_fused_tail_lse[kMaxFuseTailTilesInMerge];
-  __shared__ float sh_fused_tail_o[kMaxFuseTailTilesInMerge * kHeadDim];
+  float* sh_fused_tail_o = reinterpret_cast<float*>(dyn_smem);
+  float* sh_fused_tail_lse = sh_fused_tail_o + kMaxFuseTailTilesInMerge * kHeadDim;
 
   for (int task = blockIdx.x; task < total; task += gridDim.x) {
     int hq = task % p.Hq;
@@ -3713,88 +4380,144 @@ __device__ void phase4_merge_write(
     bool use_reduced_rect =
         !per_head_rect && group_mode[go] != kGroupModeMacHit &&
         original_rect_tiles > rect_reduce_threshold_for_counts(p, group_mode[go], task_counts);
+    int head_begin = head_rect_start[ho];
+    int head_end = head_new_end[ho];
     int rect_tile_begin = 0;
     int rect_tile_end = rect_tiles;
     if (per_head_rect) {
-      int head_begin = head_rect_start[ho];
-      int head_end = head_new_end[ho];
       int head_tiles = (head_end > head_begin) ? ceil_div_i32(head_end - head_begin, p.tile_tokens) : 0;
       use_reduced_rect = head_tiles > kRectReduceChunk;
       rect_tile_begin = 0;
       rect_tile_end = use_reduced_rect ? ceil_div_i32(head_tiles, reduce_chunk) : head_tiles;
+      for (int tile = rect_tile_begin; tile < rect_tile_end; ++tile) {
+        int64_t lse_off =
+            use_reduced_rect
+                ? (((static_cast<int64_t>(n) * p.Hkv + hkv) * p.max_tiles_reduce + tile) *
+                   p.group_size + lane_id)
+                : (((static_cast<int64_t>(n) * p.Hkv + hkv) * p.max_tiles_context + tile) *
+                   p.group_size + lane_id);
+        merge_partial_rect_tile_into_state(
+            p, lse_off, use_reduced_rect, partial_rect_o, partial_rect_lse,
+            partial_rect_reduced_o, partial_rect_reduced_lse, dim, owns_dim, acc,
+            state_lse, state_valid, &sh_lse, &sh_valid, &sh_w_state, &sh_w_other,
+            &sh_take_other, &sh_other_valid);
+      }
     } else if (rect_tiles > 0) {
       int group_begin = group_rect_begin[go];
-      int head_begin = head_rect_start[ho];
-      int head_end = head_new_end[ho];
-      if (head_end <= head_begin) {
-        rect_tile_end = 0;
-      } else {
-        int rel_begin = head_begin - group_begin;
-        int rel_end = head_end - group_begin;
-        if (rel_begin < 0) rel_begin = 0;
-        if (rel_end < 0) rel_end = 0;
-        int orig_tile_begin = rel_begin / rect_tile_tokens;
-        int orig_tile_end = ceil_div_i32(rel_end, rect_tile_tokens);
-        if (use_reduced_rect) {
-          rect_tile_begin = orig_tile_begin / reduce_chunk;
-          rect_tile_end = ceil_div_i32(orig_tile_end, reduce_chunk);
-        } else {
-          rect_tile_begin = orig_tile_begin;
-          rect_tile_end = orig_tile_end;
-        }
-        if (rect_tile_begin < 0) rect_tile_begin = 0;
-        if (rect_tile_end > rect_tiles) rect_tile_end = rect_tiles;
-      }
-    }
-    for (int tile = rect_tile_begin; tile < rect_tile_end; ++tile) {
-      int64_t lse_off =
-          use_reduced_rect
-              ? (((static_cast<int64_t>(n) * p.Hkv + hkv) * p.max_tiles_reduce + tile) *
-                 p.group_size + lane_id)
-              : (((static_cast<int64_t>(n) * p.Hkv + hkv) * p.max_tiles_context + tile) *
+      int group_end = group_rect_end[go];
+      int mode = group_mode[go];
+      int sink_tiles_total = front_sink_tiles_for_group(p, mode, group_end);
+
+      // Only band tiles are merged into the state here; the front-sink tiles
+      // are merged into the OUTPUT after the cache write below, so stored
+      // entries exclude [0, min(F, prefix_end)) by construction.
+      if (mode == kGroupModeMacHit) {
+        if (head_end > head_begin) {
+          int rel_begin = head_begin - group_begin;
+          int rel_end = head_end - group_begin;
+          if (rel_begin < 0) rel_begin = 0;
+          if (rel_end < 0) rel_end = 0;
+          int orig_tile_begin = rel_begin / rect_tile_tokens;
+          int orig_tile_end = ceil_div_i32(rel_end, rect_tile_tokens);
+          for (int tile = orig_tile_begin; tile < orig_tile_end; ++tile) {
+            int physical_tile = sink_tiles_total + tile;
+            if (physical_tile < 0 || physical_tile >= rect_tiles) continue;
+            int64_t lse_off =
+                (((static_cast<int64_t>(n) * p.Hkv + hkv) * p.max_tiles_context +
+                  physical_tile) *
                  p.group_size + lane_id);
-      if (threadIdx.x == 0) {
-        float w_state = 1.0f, w_other = 0.0f;
-        bool take_other = false;
-        float other_lse =
-            use_reduced_rect ? partial_rect_reduced_lse[lse_off] : partial_rect_lse[lse_off];
-        bool other_valid = isfinite(other_lse);
-        merge_scalar(state_lse, state_valid, other_lse, w_state, w_other, take_other);
-        sh_lse = state_lse;
-        sh_valid = state_valid;
-        sh_w_state = w_state;
-        sh_w_other = w_other;
-        sh_take_other = take_other;
-        sh_other_valid = other_valid;
-      }
-      __syncthreads();
-      state_lse = sh_lse;
-      state_valid = sh_valid;
-      if (owns_dim && (sh_take_other || sh_other_valid)) {
-        float other =
-            use_reduced_rect
-                ? load_partial_o(partial_rect_reduced_o, lse_off * p.D + dim, p.partial_o_bf16)
-                : load_partial_o(partial_rect_o, lse_off * p.D + dim, p.partial_o_bf16);
-        if (sh_take_other) {
-          acc = other;
-        } else {
-          acc = sh_w_state * acc + sh_w_other * other;
+            merge_partial_rect_tile_into_state(
+                p, lse_off, false, partial_rect_o, partial_rect_lse,
+                partial_rect_reduced_o, partial_rect_reduced_lse, dim, owns_dim, acc,
+                state_lse, state_valid, &sh_lse, &sh_valid, &sh_w_state, &sh_w_other,
+                &sh_take_other, &sh_other_valid);
+          }
+        }
+      } else {
+        // Fallback/mixed band region already starts after the group's sink
+        // (group_begin == min(F, new_end)); merge the band tiles overlapping
+        // this head. Raw band tiles sit physically after the sink tiles;
+        // reduced band tiles are indexed from 0 (the reducer skips the sink).
+        int band_orig_tile_begin = 0;
+        int band_orig_tile_end = 0;
+        if (head_end > head_begin) {
+          int rel_begin = head_begin - group_begin;
+          int rel_end = head_end - group_begin;
+          if (rel_begin < 0) rel_begin = 0;
+          if (rel_end < 0) rel_end = 0;
+          band_orig_tile_begin = rel_begin / rect_tile_tokens;
+          band_orig_tile_end = ceil_div_i32(rel_end, rect_tile_tokens);
+        }
+
+        int band_tile_begin = band_orig_tile_begin;
+        int band_tile_end = band_orig_tile_end;
+        if (use_reduced_rect) {
+          band_tile_begin = band_orig_tile_begin / reduce_chunk;
+          band_tile_end = ceil_div_i32(band_orig_tile_end, reduce_chunk);
+        }
+        if (band_tile_end > rect_tiles) band_tile_end = rect_tiles;
+
+        for (int tile = band_tile_begin; tile < band_tile_end; ++tile) {
+          int64_t physical_tile =
+              use_reduced_rect ? static_cast<int64_t>(tile)
+                               : static_cast<int64_t>(sink_tiles_total + tile);
+          int64_t lse_off =
+              use_reduced_rect
+                  ? (((static_cast<int64_t>(n) * p.Hkv + hkv) * p.max_tiles_reduce +
+                      physical_tile) *
+                     p.group_size + lane_id)
+                  : (((static_cast<int64_t>(n) * p.Hkv + hkv) * p.max_tiles_context +
+                      physical_tile) *
+                     p.group_size + lane_id);
+          merge_partial_rect_tile_into_state(
+              p, lse_off, use_reduced_rect, partial_rect_o, partial_rect_lse,
+              partial_rect_reduced_o, partial_rect_reduced_lse, dim, owns_dim, acc,
+              state_lse, state_valid, &sh_lse, &sh_valid, &sh_w_state, &sh_w_other,
+              &sh_take_other, &sh_other_valid);
         }
       }
-      __syncthreads();
     }
 
+    // Cache write BEFORE the sink merge: the stored entry covers exactly
+    // [min(F, new_end), new_end) — hit heads: reused [F, rect_start) plus band;
+    // miss heads: band from min(F, new_end). Exclusion by construction; no
+    // sink metadata is needed and no subtraction ever happens.
     float cache_lse = state_lse;
     bool cache_valid = state_valid;
-    if (owns_dim) {
+    // Not-ready requests (graph replay while the prefill offload is still
+    // populating this request's rows) must not touch any cache row.
+    const bool cache_row_writable = request_persistent_ready(p, req);
+    if (owns_dim && cache_row_writable) {
       query_cache[q_cache_base + dim] = q_pre[(static_cast<int64_t>(n) * p.Hq + hq) * p.D + dim];
       attn_cache[q_cache_base + dim] = cache_valid ? float_to_bf16(acc) : float_to_bf16(0.0f);
     }
-    if (threadIdx.x == 0) {
+    if (threadIdx.x == 0 && cache_row_writable) {
       lse_cache[(static_cast<int64_t>(req) * p.M + dest_slot) * p.Hq + hq] =
           cache_valid ? cache_lse : -kInf;
     }
     __syncthreads();
+
+    // Front-sink merge (output-only), for every head in every group mode: the
+    // sink region [0, min(F, head_rect_start)) was recomputed under the CURRENT
+    // post-RoPE query by the complete producers into the leading physical tiles.
+    if (!per_head_rect && p.front_sink_tokens > 0) {
+      int fs_mode = group_mode[go];
+      int fs_group_end = group_rect_end[go];
+      int fs_sink_tiles_total = front_sink_tiles_for_group(p, fs_mode, fs_group_end);
+      int fs_sink_end = head_front_sink_end(p, head_begin, head_end);
+      int fs_tile_end = fs_sink_end > 0 ? ceil_div_i32(fs_sink_end, p.tile_tokens) : 0;
+      if (fs_tile_end > fs_sink_tiles_total) fs_tile_end = fs_sink_tiles_total;
+      for (int tile = 0; tile < fs_tile_end; ++tile) {
+        int64_t lse_off =
+            (((static_cast<int64_t>(n) * p.Hkv + hkv) * p.max_tiles_context + tile) *
+             p.group_size + lane_id);
+        merge_partial_rect_tile_into_state(
+            p, lse_off, false, partial_rect_o, partial_rect_lse,
+            partial_rect_reduced_o, partial_rect_reduced_lse, dim, owns_dim, acc,
+            state_lse, state_valid, &sh_lse, &sh_valid, &sh_w_state, &sh_w_other,
+            &sh_take_other, &sh_other_valid);
+      }
+    }
 
     int tail_tiles = group_tail_tiles[go];
     bool group_full_fallback = group_mode[go] == kGroupModeFullFallback;
@@ -3826,8 +4549,8 @@ __device__ void phase4_merge_write(
       int tail_begin_base = group_tail_begin[go];
       int tail_end_all = group_tail_end[go];
       for (int tile = warp; tile < tail_tiles; tile += warps) {
-        int begin = tail_begin_base + tile * p.tile_tokens;
-        int end = min(begin + p.tile_tokens, tail_end_all);
+        int begin = tail_begin_base + tile * p.tail_tile_tokens;
+        int end = min(begin + p.tail_tile_tokens, tail_end_all);
         float tile_m = -kInf;
         float tile_denom = 0.0f;
         bool tile_valid = false;
@@ -3961,7 +4684,22 @@ __device__ void phase4_merge_write(
   }
 }
 
-__global__ void mac_persistent_decode_kernel(
+// Two launch-bounds instantiations: block 128 (GQA<=4) and block 256 (GQA>4,
+// e.g. Qwen3-30B). Without an explicit bound ptxas used 104 regs/thread,
+// which rounds occupancy down to 4 blocks/SM; capping to 102 (block 128)
+// lifts the persistent grid to 5 blocks/SM with negligible spill.
+#ifndef MAC_PERSISTENT_LB_MIN_BLOCKS_128
+#define MAC_PERSISTENT_LB_MIN_BLOCKS_128 5
+#endif
+#ifndef MAC_PERSISTENT_LB_MIN_BLOCKS_256
+#define MAC_PERSISTENT_LB_MIN_BLOCKS_256 2
+#endif
+template <int BlockThreads>
+__global__ void __launch_bounds__(
+    BlockThreads,
+    BlockThreads == 128 ? MAC_PERSISTENT_LB_MIN_BLOCKS_128
+                        : MAC_PERSISTENT_LB_MIN_BLOCKS_256)
+mac_persistent_decode_kernel(
     Params p,
     const __nv_bfloat16* __restrict__ q_post,
     const __nv_bfloat16* __restrict__ q_pre,
@@ -4014,6 +4752,17 @@ __global__ void mac_persistent_decode_kernel(
   if (record_phase_cycles && blockIdx.x == 0 && threadIdx.x == 0) {
     phase_cycles[0] = static_cast<int64_t>(clock64());
   }
+  // Tail prepass: tail spans depend only on past_len, so they can stream
+  // (bandwidth-bound) while the match scan stalls on probe latency. Writes
+  // are idempotent stores; the scheduler emits no tail tasks when active.
+  if (tail_prepass_active(p)) {
+    phase_tail_attention_group_direct_z2<BlockThreads>(
+        p, q_post, k_buffer, v_buffer, req_to_token, req_ids, past_lens,
+        out_cache_loc_i32, out_cache_loc_i64, group_tail_begin, group_tail_end,
+        group_tail_tiles, group_mode, tail_task_go, tail_task_tile, task_counts,
+        partial_tail_o, partial_tail_lse, p.max_tiles_tail, dyn_smem,
+        /*tail_group_direct_z2_on=*/false, /*prepass=*/true);
+  }
   phase1_match_scan(p, q_pre, query_cache, req_ids, past_lens, match_dist, match_pos, match_slot);
   grid.sync();
   if (record_phase_cycles && blockIdx.x == 0 && threadIdx.x == 0) {
@@ -4030,7 +4779,7 @@ __global__ void mac_persistent_decode_kernel(
     phase_cycles[2] = static_cast<int64_t>(clock64());
   }
   if (task_counts[6] > 0 || mixed_group_direct_z2_enabled(p)) {
-    phase_complete_attention_group_direct_z2(
+    phase_complete_attention_group_direct_z2<BlockThreads>(
         p, q_post, k_buffer, v_buffer, req_to_token, req_ids, past_lens, out_cache_loc_i32,
         out_cache_loc_i64, group_rect_begin, group_rect_end, group_rect_tiles, group_mode,
         head_hit, head_rect_start, head_new_end, complete_task_go, complete_task_tile, task_counts,
@@ -4043,7 +4792,7 @@ __global__ void mac_persistent_decode_kernel(
                                        group_mode,
                                        complete_task_go, complete_task_tile, task_counts,
                                        partial_rect_o, partial_rect_lse, p.max_tiles_context,
-                                       false);
+                                       false, dyn_smem);
   phase_complete_attention_head_direct(p, q_post, k_buffer, v_buffer, req_to_token, req_ids, past_lens,
                                        out_cache_loc_i32, out_cache_loc_i64,
                                        head_rect_start, head_new_end,
@@ -4066,14 +4815,15 @@ __global__ void mac_persistent_decode_kernel(
   }
   const bool tail_group_direct_z2_on = tail_group_direct_z2_active(p, task_counts);
   if (tail_group_direct_z2_on) {
-    phase_tail_attention_group_direct_z2(p, q_post, k_buffer, v_buffer, req_to_token,
+    phase_tail_attention_group_direct_z2<BlockThreads>(p, q_post, k_buffer, v_buffer, req_to_token,
                                          req_ids, past_lens, out_cache_loc_i32,
                                          out_cache_loc_i64, group_tail_begin,
                                          group_tail_end, group_tail_tiles, group_mode,
                                          tail_task_go, tail_task_tile, task_counts,
                                          partial_tail_o, partial_tail_lse,
                                          p.max_tiles_tail, dyn_smem,
-                                         tail_group_direct_z2_on);
+                                         tail_group_direct_z2_on,
+                                         /*prepass=*/false);
   }
   phase_attention_tiles_compact<true>(p, q_post, k_buffer, v_buffer, req_to_token, req_ids, past_lens,
                                       out_cache_loc_i32, out_cache_loc_i64,
@@ -4082,7 +4832,7 @@ __global__ void mac_persistent_decode_kernel(
                                       group_mode,
                                       tail_task_go, tail_task_tile, task_counts,
                                       partial_tail_o, partial_tail_lse, p.max_tiles_tail,
-                                      tail_group_direct_z2_on);
+                                      tail_group_direct_z2_on, dyn_smem);
   phase_tail_attention_head_direct(p, q_post, k_buffer, v_buffer, req_to_token, req_ids, past_lens,
                                    out_cache_loc_i32, out_cache_loc_i64, group_tail_begin,
                                    group_tail_end, hit_tail_task_ho, hit_tail_task_tile,
@@ -4111,19 +4861,20 @@ __global__ void mac_persistent_decode_kernel(
     bool use_head_vec_reduce = full_fallback_head_reduce_enabled(p);
     bool use_mixed_head_vec_reduce = mixed_head_reduce_enabled(p);
     if (task_counts[6] > 0 && use_head_vec_reduce) {
-      phase_reduce_full_fallback_head_vec(
+      phase_reduce_full_fallback_head_vec<BlockThreads>(
           p, group_mode, group_rect_begin, group_rect_end, group_rect_tiles, task_counts,
-          partial_rect_o, partial_rect_lse, partial_rect_reduced_o, partial_rect_reduced_lse);
+          partial_rect_o, partial_rect_lse, partial_rect_reduced_o, partial_rect_reduced_lse,
+          dyn_smem);
     } else if (task_counts[6] > 0) {
       phase_reduce_full_fallback_group_warp(
           p, group_mode, group_rect_begin, group_rect_end, group_rect_tiles, task_counts,
           partial_rect_o, partial_rect_lse, partial_rect_reduced_o, partial_rect_reduced_lse);
     }
     if (use_mixed_head_vec_reduce) {
-      phase_reduce_mixed_rect_head_vec(
+      phase_reduce_mixed_rect_head_vec<BlockThreads>(
           p, group_mode, group_rect_begin, group_rect_end, head_rect_start, head_new_end,
           group_rect_tiles, task_counts, partial_rect_o, partial_rect_lse,
-          partial_rect_reduced_o, partial_rect_reduced_lse);
+          partial_rect_reduced_o, partial_rect_reduced_lse, dyn_smem);
     }
     bool generic_needs_full_groups =
         task_counts[6] > 0 && !full_fallback_warp_reduce_enabled(p);
@@ -4163,7 +4914,7 @@ __global__ void mac_persistent_decode_kernel(
                      group_rect_begin, group_rect_end, group_rect_tiles, group_mode,
                      group_tail_begin, group_tail_end, group_tail_tiles, task_counts, partial_rect_o,
                      partial_rect_lse, partial_rect_reduced_o, partial_rect_reduced_lse, partial_tail_o,
-                     partial_tail_lse);
+                     partial_tail_lse, dyn_smem);
   if (record_phase_cycles && p.phase_cycles_count > 10 && blockIdx.x == 0 && threadIdx.x == 0) {
     phase_cycles[10] = static_cast<int64_t>(clock64());
   }
@@ -4256,6 +5007,7 @@ void mac_persistent_decode_bf16(
     int64_t tile_tokens,
     int64_t match_tile_slots,
     int64_t semantic_pos_ahead,
+    int64_t front_sink_tokens,
     int64_t gen_min_limit,
     int64_t lookback_right,
     int64_t candidate_mode,
@@ -4271,7 +5023,11 @@ void mac_persistent_decode_bf16(
     double bench_match_lag_std,
     int64_t bench_seed,
     int64_t bench_miss_mask,
-    int64_t bench_layer_id) {
+    int64_t bench_layer_id,
+    Tensor query_post_cache,
+    Tensor mac_cache_ready,
+    Tensor mac_cache_epoch,
+    Tensor mac_request_epoch) {
   check_tensor(q_post, "q_post", at::kBFloat16, 3);
   check_tensor(q_pre, "q_pre", at::kBFloat16, 3);
   check_tensor(k_buffer, "k_buffer", at::kBFloat16, 3);
@@ -4286,6 +5042,11 @@ void mac_persistent_decode_bf16(
       out_cache_loc.scalar_type() == at::kInt || out_cache_loc.scalar_type() == at::kLong,
       "out_cache_loc must be int32 or int64");
   check_tensor(query_cache, "query_cache", at::kBFloat16, 4);
+  // query_post_cache is a legacy argument from the (removed) front-sink
+  // downdate design; it is accepted for signature compatibility and ignored.
+  if (query_post_cache.defined() && query_post_cache.numel() > 0) {
+    check_tensor(query_post_cache, "query_post_cache", at::kBFloat16, 4);
+  }
   check_tensor(attn_cache, "attn_cache", at::kBFloat16, 4);
   check_tensor(lse_cache, "lse_cache", at::kFloat, 3);
   check_tensor(out, "out", at::kBFloat16, 3);
@@ -4391,10 +5152,35 @@ void mac_persistent_decode_bf16(
   TORCH_CHECK(max_tail_tasks >= N * Hkv * max_tiles_tail, "tail task workspace too small");
   TORCH_CHECK(max_hit_tail_tasks >= N * Hq * max_tiles_tail, "hit tail task workspace too small");
 
+  // Optional device-side readiness gate (empty tensors = every request
+  // ready). Required for CUDA-graph replay, where the python-side
+  // `_persistent_ready` gate cannot run per step.
+  const uint8_t* cache_ready_ptr = nullptr;
+  const int64_t* cache_epoch_ptr = nullptr;
+  const int64_t* request_epoch_ptr = nullptr;
+  if (mac_cache_ready.defined() && mac_cache_ready.numel() > 0) {
+    CHECK_CUDA(mac_cache_ready);
+    CHECK_CONTIG(mac_cache_ready);
+    TORCH_CHECK(mac_cache_ready.scalar_type() == at::kBool ||
+                    mac_cache_ready.scalar_type() == at::kByte,
+                "mac_cache_ready must be bool or uint8");
+    cache_ready_ptr = reinterpret_cast<const uint8_t*>(mac_cache_ready.data_ptr());
+    if (mac_cache_epoch.defined() && mac_cache_epoch.numel() > 0 &&
+        mac_request_epoch.defined() && mac_request_epoch.numel() > 0) {
+      check_tensor(mac_cache_epoch, "mac_cache_epoch", at::kLong, 1);
+      check_tensor(mac_request_epoch, "mac_request_epoch", at::kLong, 1);
+      cache_epoch_ptr = mac_cache_epoch.data_ptr<int64_t>();
+      request_epoch_ptr = mac_request_epoch.data_ptr<int64_t>();
+    }
+  }
+
   c10::cuda::CUDAGuard guard(q_post.device());
   cudaStream_t stream = at::cuda::getCurrentCUDAStream(q_post.get_device()).stream();
 
   Params p{};
+  p.cache_ready_ptr = cache_ready_ptr;
+  p.cache_epoch_ptr = cache_epoch_ptr;
+  p.request_epoch_ptr = request_epoch_ptr;
   p.N = N;
   p.Hq = Hq;
   p.Hkv = Hkv;
@@ -4415,6 +5201,20 @@ void mac_persistent_decode_bf16(
   p.match_tile_slots = (int)match_tile_slots;
   p.match_early_exit = env_flag("MAC_PERSISTENT_MATCH_EARLY_EXIT", 1);
   p.semantic_pos_ahead = (int)semantic_pos_ahead;
+  // Tail granularity: the whole tail span is ~semantic_pos_ahead tokens per
+  // group; two tiles keep some parallelism while cutting the task count 4x
+  // (the per-task fixed costs dominated with tile_tokens-sized slices).
+  p.tail_tile_tokens = env_int("MAC_PERSISTENT_TAIL_TILE_TOKENS", 0);
+  if (p.tail_tile_tokens <= 0) {
+    int half_span = p.semantic_pos_ahead > 0 ? (p.semantic_pos_ahead + 1) / 2 : 0;
+    p.tail_tile_tokens = half_span > p.tile_tokens ? half_span : p.tile_tokens;
+  }
+  // The tail partial workspace has ceil(sem/tile_tokens) slots; a smaller
+  // tail tile would overflow it.
+  if (p.tail_tile_tokens < p.tile_tokens) p.tail_tile_tokens = p.tile_tokens;
+  p.tail_prepass = env_flag("MAC_PERSISTENT_TAIL_PREPASS", 0);
+  p.front_sink_tokens = (int)front_sink_tokens;
+  if (p.front_sink_tokens < 0) p.front_sink_tokens = 0;
   p.gen_min_limit = (int)gen_min_limit;
   p.lookback_right = (int)lookback_right;
   p.candidate_mode = (int)candidate_mode;
@@ -4431,7 +5231,13 @@ void mac_persistent_decode_bf16(
   p.all_hit_direct = env_flag("MAC_PERSISTENT_ALL_HIT_DIRECT", 0);
   p.hit_complete_head_direct = env_flag("MAC_PERSISTENT_HIT_COMPLETE_HEAD_DIRECT", 1);
   p.full_fallback_group_direct = env_flag("MAC_PERSISTENT_FULL_FALLBACK_GROUP_DIRECT", 1);
-  p.full_fallback_head_direct = env_flag("MAC_PERSISTENT_FULL_FALLBACK_HEAD_DIRECT", 1);
+  // For GQA > 4 there is no z2 group producer (yet); the per-head direct
+  // producer walks tokens serially with no staging and collapses on long
+  // full-fallback bands (group-8 @128k: 100ms vs 26ms staged), so route full
+  // fallback through the staged compact producer by default. Short mixed-band
+  // per-head work (mixed_early_miss_direct) stays on the direct path.
+  p.full_fallback_head_direct = env_flag(
+      "MAC_PERSISTENT_FULL_FALLBACK_HEAD_DIRECT", group_size > 4 ? 0 : 1);
   p.full_fallback_group_merge = env_flag("MAC_PERSISTENT_FULL_FALLBACK_GROUP_MERGE", 0);
   p.full_fallback_head_reduce =
       env_flag("MAC_PERSISTENT_FULL_FALLBACK_HEAD_REDUCE", 1);
@@ -4447,6 +5253,18 @@ void mac_persistent_decode_bf16(
   p.parallel_z2_schedule = env_flag("MAC_PERSISTENT_PARALLEL_Z2_SCHEDULE", 1);
   p.mixed_misspack_z2 = env_flag("MAC_PERSISTENT_MIXED_MISSPACK_Z2", 1);
   p.mixed_early_miss_direct = env_flag("MAC_PERSISTENT_MIXED_EARLY_MISS_DIRECT", 1);
+  if (p.front_sink_tokens > 0) {
+    // Front-sink exclusion (v2): the producers and schedulers understand the
+    // [sink | band] physical tile layout (complete_tile_bounds emits sink
+    // tiles first; sink tiles are full-group work, never misspack or
+    // per-miss-head), the fast reducers offset band tiles by the group's sink
+    // tiles and reduce band tiles only, and the z2 producer keeps sink tiles
+    // in natural-log domain for phase4's raw output-only sink merge. The one
+    // remaining unaudited path under this layout is the standalone
+    // full-fallback group merge, so keep it on the generic phase4 route.
+    p.full_fallback_group_merge = 0;
+    p.fuse_fallback_tail_in_merge = 0;
+  }
   p.partial_o_bf16 = partial_o_dtype == at::kBFloat16 ? 1 : 0;
   p.long_rect_tile_tokens = env_int("MAC_PERSISTENT_LONG_RECT_TILE_TOKENS", 384);
   if (p.long_rect_tile_tokens < p.tile_tokens) p.long_rect_tile_tokens = p.tile_tokens;
@@ -4503,10 +5321,18 @@ void mac_persistent_decode_bf16(
   if (p.full_fallback_reduce_threshold < 1) p.full_fallback_reduce_threshold = 1;
   p.sparse_fallback_unfuse_tail =
       env_flag("MAC_PERSISTENT_SPARSE_FALLBACK_UNFUSE_TAIL", 1);
+  // Needs the block size to know whether a z2 producer instantiation exists.
+  int block_threads = env_int("MAC_PERSISTENT_BLOCK_THREADS", group_size > 4 ? 256 : 128);
+  if (block_threads < group_size * 32) block_threads = group_size * 32;
+  if (block_threads != 128 && block_threads != 256) block_threads = group_size > 4 ? 256 : 128;
   int mixed_group_direct_default_min =
-      (p.mixed_group_direct_z2 != 0 && p.group_size == 4 && p.D == kHeadDim) ? 1 : p.group_size;
+      (p.mixed_group_direct_z2 != 0 &&
+       z2_parts_for_config(block_threads, p.group_size, p.D) > 0)
+          ? 1
+          : p.group_size;
   p.mixed_group_direct_min_miss_heads =
       env_int("MAC_PERSISTENT_MIXED_GROUP_DIRECT_MIN_MISS_HEADS", mixed_group_direct_default_min);
+  p.task_overhead_tokens = env_int("MAC_PERSISTENT_TASK_OVERHEAD_TOKENS", 128);
   p.bench_mode = (int)bench_mode;
   p.bench_exact_quota = env_flag("MAC_BENCH_EXACT_QUOTA", 1);
   p.bench_seed = (int)bench_seed;
@@ -4522,38 +5348,75 @@ void mac_persistent_decode_bf16(
   p.bench_match_lag_mean = (float)bench_match_lag_mean;
   p.bench_match_lag_std = (float)bench_match_lag_std;
 
-  int block_threads = env_int("MAC_PERSISTENT_BLOCK_THREADS", group_size > 4 ? 256 : 128);
-  if (block_threads < group_size * 32) block_threads = group_size * 32;
-  if (block_threads != 128 && block_threads != 256) block_threads = group_size > 4 ? 256 : 128;
   TORCH_CHECK(block_threads >= D, "persistent decode v1 merge requires at least one thread per head dim");
-  bool needs_direct_z2_smem =
-      p.group_size == 4 && p.D == kHeadDim && block_threads == 128 &&
-      (p.full_fallback_group_direct != 0 || p.tail_group_direct_z2 != 0);
-  int coop_dynamic_smem = needs_direct_z2_smem ? kDirectZ2SmemBytes : 0;
-  if (coop_dynamic_smem > 0) {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(
-        mac_persistent_decode_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        coop_dynamic_smem));
-    C10_CUDA_CHECK(cudaFuncSetAttribute(
-        mac_persistent_decode_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
-  }
-
+  // Every phase carves its bulk shared memory from one dynamic pool (see
+  // smem_pool_bytes); the pool is required regardless of which fast paths are
+  // active and scales with the block variant (z2 stage = blockDim/16 tokens).
+  int coop_dynamic_smem = block_threads == 128 ? smem_pool_bytes(128) : smem_pool_bytes(256);
+  void* kernel_fn = block_threads == 128
+                        ? reinterpret_cast<void*>(mac_persistent_decode_kernel<128>)
+                        : reinterpret_cast<void*>(mac_persistent_decode_kernel<256>);
   int device = q_post.get_device();
-  int coop = 0;
-  C10_CUDA_CHECK(cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, device));
-  TORCH_CHECK(coop != 0, "device does not support cooperative launch");
-  int sm_count = 0;
-  C10_CUDA_CHECK(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
-  int active_per_sm = 0;
-  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &active_per_sm, mac_persistent_decode_kernel, block_threads, coop_dynamic_smem));
-  TORCH_CHECK(active_per_sm > 0, "persistent kernel has zero occupancy");
+  // The attribute/occupancy queries are stream-capture legal (verified on
+  // CUDA 13) but cost several driver calls per launch; cache them per
+  // (device, block variant). dyn smem is the compile-time pool size, so the
+  // occupancy result never changes after the first call.
+  struct LaunchInfo {
+    int sm_count;
+    int active_per_sm;
+  };
+  static std::mutex launch_info_mu;
+  static std::map<std::pair<int, int>, LaunchInfo> launch_info_cache;
+  LaunchInfo info;
+  {
+    std::lock_guard<std::mutex> lock(launch_info_mu);
+    auto key = std::make_pair(device, block_threads);
+    auto it = launch_info_cache.find(key);
+    if (it == launch_info_cache.end()) {
+      C10_CUDA_CHECK(cudaFuncSetAttribute(
+          kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize,
+          coop_dynamic_smem));
+      // The default shared-memory carveout (~100KB/SM) caps the 128-thread
+      // variant at 4 blocks/SM once the z2 ring pool is 20.5KB; ask for the
+      // full carveout so occupancy stays register-limited (5 at block 128,
+      // 2 at block 256).
+      C10_CUDA_CHECK(cudaFuncSetAttribute(
+          kernel_fn, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+      int coop = 0;
+      C10_CUDA_CHECK(cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, device));
+      TORCH_CHECK(coop != 0, "device does not support cooperative launch");
+      C10_CUDA_CHECK(cudaDeviceGetAttribute(&info.sm_count,
+                                            cudaDevAttrMultiProcessorCount, device));
+      C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+          &info.active_per_sm, kernel_fn, block_threads, coop_dynamic_smem));
+      TORCH_CHECK(info.active_per_sm > 0, "persistent kernel has zero occupancy");
+      launch_info_cache.emplace(key, info);
+    } else {
+      info = it->second;
+    }
+  }
+  int sm_count = info.sm_count;
+  int active_per_sm = info.active_per_sm;
   int max_grid = active_per_sm * sm_count;
   int default_cap = 1024 * (p.N > 0 ? p.N : 1);
   if (default_cap > max_grid) default_cap = max_grid;
   int cap = env_int("MAC_PERSISTENT_COOP_CTAS", default_cap);
   int grid = cap < max_grid ? cap : max_grid;
   if (grid < 1) grid = 1;
+  if (env_flag("MAC_PERSISTENT_DEBUG_LAUNCH", 0)) {
+    // ncu cannot profile cooperative launches; this is the occupancy story.
+    static bool printed = false;
+    if (!printed) {
+      printed = true;
+      cudaFuncAttributes attr{};
+      C10_CUDA_CHECK(cudaFuncGetAttributes(&attr, kernel_fn));
+      printf(
+          "[mac_persistent] grid=%d block=%d active_per_sm=%d sm_count=%d "
+          "regs/thread=%d static_smem=%zuB dyn_smem=%dB local=%zuB\n",
+          grid, block_threads, active_per_sm, sm_count, attr.numRegs,
+          attr.sharedSizeBytes, coop_dynamic_smem, attr.localSizeBytes);
+    }
+  }
 
   const __nv_bfloat16* q_post_ptr = reinterpret_cast<const __nv_bfloat16*>(q_post.data_ptr<at::BFloat16>());
   const __nv_bfloat16* q_pre_ptr = reinterpret_cast<const __nv_bfloat16*>(q_pre.data_ptr<at::BFloat16>());
@@ -4650,7 +5513,7 @@ void mac_persistent_decode_bf16(
       &phase_cycles_ptr,
   };
   C10_CUDA_CHECK(cudaLaunchCooperativeKernel(
-      reinterpret_cast<void*>(mac_persistent_decode_kernel),
+      kernel_fn,
       dim3(grid),
       dim3(block_threads),
       kernel_args,

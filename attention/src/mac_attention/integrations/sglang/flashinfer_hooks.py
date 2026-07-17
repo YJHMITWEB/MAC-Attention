@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import inspect
+import json
+import logging
 import math
 import os
 import sys
+import threading
+import time
+from pathlib import Path
 from typing import Any, Optional
 
 import torch
@@ -24,6 +29,11 @@ from .profiling import enabled as profiling_enabled
 from .profiling import profile_block
 
 
+_WORKFLOW_AUDIT_LOCK = threading.Lock()
+_WORKFLOW_AUDIT_COUNT = 0
+_PROFILE_LOGGERS: dict[str, logging.Logger] = {}
+
+
 def _graph_trace(message: str, layer: Any = None) -> None:
     if os.environ.get("MAC_DEBUG_GRAPH_TRACE", "0").strip().lower() not in {
         "1",
@@ -37,6 +47,525 @@ def _graph_trace(message: str, layer: Any = None) -> None:
     if layer_id is not None:
         prefix += f"[layer={layer_id}]"
     print(f"{prefix} {message}", file=sys.stderr, flush=True)
+
+
+def _env_bool(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+# Opt-in research audit. This runs exact FlashInfer after a MAC persistent decode
+# and must never be used for performance measurements.
+def _workflow_audit_enabled() -> bool:
+    return _env_bool("MAC_WORKFLOW_AUDIT", "0") or _env_bool(
+        "MAC_ATTENTION_WORKFLOW_AUDIT", "0"
+    )
+
+
+def _workflow_audit_no_rect_enabled() -> bool:
+    return _env_bool("MAC_WORKFLOW_AUDIT_NO_RECT", "1")
+
+
+def _workflow_audit_dir() -> Path:
+    root = os.environ.get("MAC_WORKFLOW_AUDIT_DIR")
+    if root:
+        return Path(root)
+    workspace = Path(os.environ.get("MAC_WORKSPACE_BASE", os.getcwd()))
+    return workspace / "profiles" / "workflow_audit"
+
+
+def _workflow_audit_rank() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return int(torch.distributed.get_rank())
+    return int(os.environ.get("RANK", "0"))
+
+
+def _workflow_audit_limit_reached() -> bool:
+    limit = int(os.environ.get("MAC_WORKFLOW_AUDIT_MAX_RECORDS", "2048"))
+    return limit >= 0 and _WORKFLOW_AUDIT_COUNT >= limit
+
+
+def _workflow_audit_int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _workflow_audit_layer_allowed(layer_id: int) -> bool:
+    raw = os.environ.get("MAC_WORKFLOW_AUDIT_LAYERS", "").strip()
+    if not raw:
+        return True
+    for part in raw.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        if "-" in item:
+            lo_text, hi_text = item.split("-", 1)
+            try:
+                lo = int(lo_text)
+                hi = int(hi_text)
+            except ValueError:
+                continue
+            if lo <= layer_id <= hi:
+                return True
+            continue
+        try:
+            if layer_id == int(item):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _workflow_audit_should_sample(layer_id: int, past_lens: torch.Tensor) -> bool:
+    if not _workflow_audit_layer_allowed(layer_id):
+        return False
+    if past_lens.numel() == 0:
+        return False
+    past_lens_i64 = past_lens.detach().to(torch.int64)
+    min_past = int(past_lens_i64.min().item())
+    max_past = int(past_lens_i64.max().item())
+    audit_min = _workflow_audit_int_env("MAC_WORKFLOW_AUDIT_MIN_PAST_LEN", -1)
+    audit_max = _workflow_audit_int_env("MAC_WORKFLOW_AUDIT_MAX_PAST_LEN", -1)
+    if audit_min >= 0 and max_past < audit_min:
+        return False
+    if audit_max >= 0 and min_past > audit_max:
+        return False
+    stride = max(1, _workflow_audit_int_env("MAC_WORKFLOW_AUDIT_PAST_STRIDE", 1))
+    anchor = audit_min if audit_min >= 0 else 0
+    return any(int(past.item()) >= anchor and (int(past.item()) - anchor) % stride == 0 for past in past_lens_i64)
+
+
+def _workflow_audit_error_stats(candidate: torch.Tensor, ref: torch.Tensor) -> dict[str, float]:
+    if candidate.numel() == 0 or ref.numel() == 0:
+        return {
+            "max_abs": 0.0,
+            "mean_abs": 0.0,
+            "rmse": 0.0,
+            "rel_l2": 0.0,
+            "cosine": 0.0,
+        }
+    cand = candidate.float()
+    ref_f = ref.float()
+    diff = cand - ref_f
+    ref_norm = float(torch.linalg.vector_norm(ref_f).item())
+    diff_norm = float(torch.linalg.vector_norm(diff).item())
+    cand_norm = float(torch.linalg.vector_norm(cand).item())
+    dot = float(torch.sum(cand * ref_f).item())
+    denom = max(cand_norm * ref_norm, 1.0e-12)
+    return {
+        "max_abs": float(diff.abs().max().item()),
+        "mean_abs": float(diff.abs().mean().item()),
+        "rmse": float(torch.sqrt(torch.mean(diff * diff)).item()),
+        "rel_l2": float(diff_norm / max(ref_norm, 1.0e-12)),
+        "cosine": float(dot / denom),
+    }
+
+
+def _mean_median(values: list[float]) -> tuple[float, float]:
+    if not values:
+        return 0.0, 0.0
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        median = ordered[mid]
+    else:
+        median = (ordered[mid - 1] + ordered[mid]) / 2.0
+    return sum(ordered) / len(ordered), median
+
+
+def _persistent_profile_logger(log_file: str) -> logging.Logger:
+    logger = _PROFILE_LOGGERS.get(log_file)
+    if logger is not None:
+        return logger
+    name = f"mac_attention_flashinfer_profile_{_workflow_audit_rank()}_{len(_PROFILE_LOGGERS)}"
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(log_file, mode="a")
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s %(name)s %(levelname)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    logger.addHandler(handler)
+    _PROFILE_LOGGERS[log_file] = logger
+    return logger
+
+
+def _log_persistent_decode_profile_snapshot(
+    metadata: Any,
+    config: Any,
+    layer_id: int,
+) -> None:
+    if not int(getattr(config, "mac_profile", 0) or 0):
+        return
+    dec_hit_total = int(metadata.decoding_hit) + int(metadata.decoding_miss)
+    interval = max(1, int(os.environ.get("MAC_PROFILE_HEAD_INTERVAL", "4096")))
+    next_total = int(getattr(metadata, "flashinfer_profile_next_total", interval))
+    if dec_hit_total < next_total:
+        return
+    metadata.flashinfer_profile_next_total = dec_hit_total + interval
+
+    root = getattr(config, "mac_profile_path", "") or str(
+        Path(os.environ.get("MAC_WORKSPACE_BASE", os.getcwd())) / "profiles" / "mac"
+    )
+    folder = (
+        f"mac_persistent_genLimit{config.mac_gen_min_limit}_"
+        f"threshold{config.mac_threshold}_left{config.mac_lookback_tokens_left}_"
+        f"right{config.mac_lookback_tokens_right}_semAhead{config.mac_semantic_pos_ahead}_"
+        f"frontSink{getattr(config, 'mac_front_sink_tokens', 0)}"
+    )
+    logger = _persistent_profile_logger(
+        str(Path(root) / folder / f"{_workflow_audit_rank()}.log")
+    )
+    dec_hit_ratio = metadata.decoding_hit / (dec_hit_total + 1.0e-8)
+    dec_skip_ratio = metadata.decoding_skipped_kv / (metadata.decoding_total_kv + 1.0e-8)
+    dec_mean_med = _mean_median(metadata.decoding_range)
+    continuous_hit = (
+        metadata.continuous_hit.detach().cpu().tolist()
+        if torch.is_tensor(getattr(metadata, "continuous_hit", None))
+        else []
+    )
+    logger.info(
+        (
+            "layer %s decoding ------- hit: %s, miss: %s, "
+            "hit ratio: %.4f, overall skipped ratio: %.4f, "
+            "avg/med fast range: %s tokens, max continuous hit per head: %s"
+        ),
+        layer_id,
+        metadata.decoding_hit,
+        metadata.decoding_miss,
+        dec_hit_ratio,
+        dec_skip_ratio,
+        dec_mean_med,
+        continuous_hit,
+    )
+
+
+def _workflow_audit_merge(
+    prefix_o: torch.Tensor,
+    prefix_lse: torch.Tensor,
+    tail_o: torch.Tensor,
+    tail_lse: torch.Tensor,
+) -> torch.Tensor:
+    if not torch.isfinite(prefix_lse):
+        return tail_o
+    if not torch.isfinite(tail_lse):
+        return prefix_o
+    m = torch.maximum(prefix_lse.float(), tail_lse.float())
+    w1 = torch.exp(prefix_lse.float() - m)
+    w2 = torch.exp(tail_lse.float() - m)
+    return (w1 * prefix_o.float() + w2 * tail_o.float()) / (w1 + w2)
+
+
+def _workflow_audit_tail_attention(
+    q_head: torch.Tensor,
+    k_buffer: torch.Tensor,
+    v_buffer: torch.Tensor,
+    req_to_token: torch.Tensor,
+    req: int,
+    cache_loc: torch.Tensor,
+    n: int,
+    hkv: int,
+    start: int,
+    end: int,
+    past_len: int,
+    sm_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if end <= start:
+        return (
+            torch.zeros_like(q_head, dtype=torch.float32),
+            torch.tensor(-float("inf"), device=q_head.device, dtype=torch.float32),
+        )
+    logical = torch.arange(start, end, device=q_head.device, dtype=torch.int64)
+    phys = req_to_token[req, logical.clamp_max(max(past_len - 1, 0)).long()].long()
+    current_mask = logical == int(past_len)
+    if bool(current_mask.any().item()):
+        phys = phys.clone()
+        phys[current_mask] = cache_loc[n].long()
+    kk = k_buffer[phys, hkv, :].float()
+    vv = v_buffer[phys, hkv, :].float()
+    logits = torch.sum(kk * q_head.float(), dim=-1) * float(sm_scale)
+    lse = torch.logsumexp(logits, dim=0)
+    probs = torch.exp(logits - lse)
+    out = torch.sum(probs[:, None] * vv, dim=0)
+    return out, lse
+
+
+def _workflow_audit_no_rect_output(
+    *,
+    q_input: torch.Tensor,
+    k_buffer: torch.Tensor,
+    v_buffer: torch.Tensor,
+    req_to_token: torch.Tensor,
+    req_ids: torch.Tensor,
+    past_lens: torch.Tensor,
+    cache_loc: torch.Tensor,
+    workspace: dict[str, torch.Tensor],
+    attn_cache_before: torch.Tensor,
+    lse_cache_before: torch.Tensor,
+    ref_out: torch.Tensor,
+    layer: Any,
+) -> torch.Tensor:
+    batch_size, hq, dim = q_input.shape
+    hkv_count = int(k_buffer.shape[1])
+    group = max(1, hq // max(1, hkv_count))
+    head_hit = workspace["head_hit"][:batch_size]
+    head_match_slot = workspace["head_match_slot"][:batch_size]
+    head_new_end = workspace["head_new_end"][:batch_size]
+    req_to_token = req_to_token.contiguous()
+    out = ref_out.float().clone()
+    for n in range(batch_size):
+        req = int(req_ids[n].item())
+        past_len = int(past_lens[n].item())
+        tail_end = past_len + 1
+        for hq_i in range(hq):
+            if int(head_hit[n, hq_i].item()) == 0:
+                continue
+            slot = int(head_match_slot[n, hq_i].item())
+            if slot < 0:
+                continue
+            hkv_i = hq_i // group
+            tail_begin = int(head_new_end[n, hq_i].item())
+            prefix_o = attn_cache_before[n, slot, hq_i, :].float()
+            prefix_lse = lse_cache_before[n, slot, hq_i].float()
+            tail_o, tail_lse = _workflow_audit_tail_attention(
+                q_input[n, hq_i, :],
+                k_buffer,
+                v_buffer,
+                req_to_token,
+                req,
+                cache_loc,
+                n,
+                hkv_i,
+                tail_begin,
+                tail_end,
+                past_len,
+                float(layer.scaling),
+            )
+            out[n, hq_i, :] = _workflow_audit_merge(prefix_o, prefix_lse, tail_o, tail_lse)
+    return out.to(ref_out.dtype)
+
+
+def _workflow_audit_record(row: dict[str, Any]) -> None:
+    global _WORKFLOW_AUDIT_COUNT
+    with _WORKFLOW_AUDIT_LOCK:
+        if _workflow_audit_limit_reached():
+            return
+        row["record_index"] = _WORKFLOW_AUDIT_COUNT
+        _WORKFLOW_AUDIT_COUNT += 1
+        out_dir = _workflow_audit_dir()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"mac_workflow_audit_rank{_workflow_audit_rank()}_pid{os.getpid()}.jsonl"
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def _maybe_audit_persistent_decode(
+    *,
+    original_fn: Any,
+    backend: Any,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    layer: Any,
+    forward_batch: Any,
+    kwargs: dict[str, Any],
+    persistent_out: torch.Tensor,
+    q_input: torch.Tensor,
+    k_buffer: torch.Tensor,
+    v_buffer: torch.Tensor,
+    cache_loc: torch.Tensor,
+    mac_metadata: Any,
+    workspace: Optional[dict[str, torch.Tensor]],
+) -> None:
+    if not _workflow_audit_enabled() or _workflow_audit_limit_reached():
+        return
+    if _is_cuda_graph_capturing():
+        return
+    if workspace is None:
+        return
+    config = getattr(backend, "mac_config", None)
+    if config is None:
+        config = get_mac_config()
+    batch_size = int(forward_batch.batch_size)
+    layer_id = int(getattr(layer, "layer_id", -1))
+    past_lens_tensor = mac_metadata.cache_lens[:batch_size]
+    if not _workflow_audit_should_sample(layer_id, past_lens_tensor):
+        return
+    try:
+        ref_flat = original_fn(
+            backend,
+            q,
+            k,
+            v,
+            layer,
+            forward_batch,
+            save_kv_cache=False,
+            **kwargs,
+        )
+        hq = int(layer.tp_q_head_num)
+        dim = int(layer.head_dim)
+        ref = ref_flat.view(batch_size, hq, dim)
+        mac = persistent_out.view(batch_size, hq, dim)
+        mac_stats = _workflow_audit_error_stats(mac, ref)
+        no_rect: Optional[torch.Tensor] = None
+        no_rect_stats: dict[str, float] = {}
+        recovery = 0.0
+        audit_state = getattr(backend, "mac_last_persistent_audit", None)
+        if (
+            _workflow_audit_no_rect_enabled()
+            and isinstance(audit_state, dict)
+            and torch.is_tensor(audit_state.get("attn_cache_before"))
+            and torch.is_tensor(audit_state.get("lse_cache_before"))
+        ):
+            no_rect = _workflow_audit_no_rect_output(
+                q_input=q_input,
+                k_buffer=k_buffer,
+                v_buffer=v_buffer,
+                req_to_token=getattr(backend.indices_updater_decode, "req_to_token"),
+                req_ids=mac_metadata.req_ids[:batch_size],
+                past_lens=mac_metadata.cache_lens[:batch_size],
+                cache_loc=cache_loc,
+                workspace=workspace,
+                attn_cache_before=audit_state["attn_cache_before"],
+                lse_cache_before=audit_state["lse_cache_before"],
+                ref_out=ref,
+                layer=layer,
+            )
+            no_rect_stats = _workflow_audit_error_stats(no_rect, ref)
+            pre_rel = float(no_rect_stats.get("rel_l2", 0.0))
+            post_rel = float(mac_stats.get("rel_l2", 0.0))
+            recovery = 1.0 - post_rel / pre_rel if pre_rel > 0.0 else 0.0
+        task_counts = workspace["task_counts"].detach().cpu().tolist()
+        head_hit = workspace["head_hit"][:batch_size]
+        hit_mask = head_hit.bool()
+        hit_heads = int(head_hit.detach().sum().item())
+        total_heads = max(1, batch_size * hq)
+        gen_min_limit = _mac_int_env("MAC_GEN_MIN_LIMIT", 2048)
+        eligible_req = past_lens_tensor >= int(gen_min_limit)
+        eligible_requests = int(eligible_req.detach().sum().item())
+        eligible_total_heads = max(1, eligible_requests * hq)
+        eligible_hit_heads = int(head_hit[eligible_req].detach().sum().item()) if eligible_requests > 0 else 0
+        mac_hit_stats = _workflow_audit_error_stats(mac[hit_mask], ref[hit_mask])
+        no_rect_hit_stats: dict[str, float] = {}
+        hit_skip_ratio_mean = 0.0
+        hit_rect_tokens_mean = 0.0
+        hit_rect_tokens_max = 0
+        if hit_heads > 0:
+            head_prefix_end = workspace["head_prefix_end"][:batch_size]
+            head_new_end = workspace["head_new_end"][:batch_size]
+            hit_prefix = head_prefix_end[hit_mask].float()
+            hit_new_end = head_new_end[hit_mask].float().clamp_min(1.0)
+            hit_rect_tokens = (hit_new_end - hit_prefix).clamp_min(0.0)
+            hit_skip_ratio_mean = float((hit_prefix / hit_new_end).mean().item())
+            hit_rect_tokens_mean = float(hit_rect_tokens.mean().item())
+            hit_rect_tokens_max = int(hit_rect_tokens.max().item())
+            if no_rect is not None:
+                no_rect_hit_stats = _workflow_audit_error_stats(
+                    no_rect[hit_mask], ref[hit_mask]
+                )
+        past_lens = past_lens_tensor.detach().cpu().tolist()
+        group_mode = workspace.get("group_mode")
+        mac_hit_groups = 0
+        mixed_fallback_groups = 0
+        eligible_groups = 0
+        eligible_mac_hit_groups = 0
+        eligible_mixed_fallback_groups = 0
+        eligible_full_fallback_groups = 0
+        if torch.is_tensor(group_mode):
+            group_mode_slice = group_mode[:batch_size]
+            mac_hit_groups = int((group_mode_slice == 0).detach().sum().item())
+            mixed_fallback_groups = int((group_mode_slice == 2).detach().sum().item())
+            if eligible_requests > 0:
+                eligible_group_mode = group_mode_slice[eligible_req]
+                eligible_groups = int(eligible_group_mode.numel())
+                eligible_mac_hit_groups = int((eligible_group_mode == 0).detach().sum().item())
+                eligible_mixed_fallback_groups = int((eligible_group_mode == 2).detach().sum().item())
+                eligible_full_fallback_groups = int((eligible_group_mode == 1).detach().sum().item())
+        row = {
+            "time": time.time(),
+            "rank": _workflow_audit_rank(),
+            "pid": os.getpid(),
+            "layer_id": layer_id,
+            "batch_size": batch_size,
+            "hq": hq,
+            "hkv": int(k_buffer.shape[1]),
+            "head_dim": dim,
+            "past_lens": [int(x) for x in past_lens],
+            "max_past_len": max(int(x) for x in past_lens) if past_lens else 0,
+            "front_sink_tokens": int(getattr(config, "mac_front_sink_tokens", 0)),
+            "hit_heads": hit_heads,
+            "hit_head_ratio": float(hit_heads / total_heads),
+            "eligible_requests": eligible_requests,
+            "eligible_hit_heads": eligible_hit_heads,
+            "eligible_hit_head_ratio": float(eligible_hit_heads / eligible_total_heads),
+            "eligible_groups": eligible_groups,
+            "eligible_mac_hit_groups": eligible_mac_hit_groups,
+            "eligible_mixed_fallback_groups": eligible_mixed_fallback_groups,
+            "eligible_full_fallback_groups": eligible_full_fallback_groups,
+            "mac_hit_groups": mac_hit_groups,
+            "mixed_fallback_groups": mixed_fallback_groups,
+            "hit_skip_ratio_mean": hit_skip_ratio_mean,
+            "hit_rect_tokens_mean": hit_rect_tokens_mean,
+            "hit_rect_tokens_max": hit_rect_tokens_max,
+            "task_counts": [int(x) for x in task_counts],
+            "complete_rows": int(task_counts[0]) if len(task_counts) > 0 else 0,
+            "group_tail_rows": int(task_counts[1]) if len(task_counts) > 1 else 0,
+            "fallback_reduce_groups": int(task_counts[3]) if len(task_counts) > 3 else 0,
+            "non_hit_groups": int(task_counts[5]) if len(task_counts) > 5 else 0,
+            "full_fallback_groups": int(task_counts[6]) if len(task_counts) > 6 else 0,
+            "mac_rel_l2": float(mac_stats["rel_l2"]),
+            "mac_max_abs": float(mac_stats["max_abs"]),
+            "mac_mean_abs": float(mac_stats["mean_abs"]),
+            "mac_rmse": float(mac_stats["rmse"]),
+            "mac_cosine": float(mac_stats["cosine"]),
+            "mac_hit_rel_l2": float(mac_hit_stats["rel_l2"]),
+            "mac_hit_max_abs": float(mac_hit_stats["max_abs"]),
+            "mac_hit_mean_abs": float(mac_hit_stats["mean_abs"]),
+            "mac_hit_rmse": float(mac_hit_stats["rmse"]),
+            "mac_hit_cosine": float(mac_hit_stats["cosine"]),
+            "no_rect_rel_l2": float(no_rect_stats.get("rel_l2", 0.0)),
+            "no_rect_max_abs": float(no_rect_stats.get("max_abs", 0.0)),
+            "no_rect_mean_abs": float(no_rect_stats.get("mean_abs", 0.0)),
+            "no_rect_rmse": float(no_rect_stats.get("rmse", 0.0)),
+            "no_rect_cosine": float(no_rect_stats.get("cosine", 0.0)),
+            "no_rect_hit_rel_l2": float(no_rect_hit_stats.get("rel_l2", 0.0)),
+            "no_rect_hit_max_abs": float(no_rect_hit_stats.get("max_abs", 0.0)),
+            "no_rect_hit_mean_abs": float(no_rect_hit_stats.get("mean_abs", 0.0)),
+            "no_rect_hit_rmse": float(no_rect_hit_stats.get("rmse", 0.0)),
+            "no_rect_hit_cosine": float(no_rect_hit_stats.get("cosine", 0.0)),
+            "rect_recovery_rel_l2": float(recovery),
+            "rect_hit_recovery_rel_l2": (
+                float(
+                    1.0
+                    - mac_hit_stats["rel_l2"]
+                    / max(float(no_rect_hit_stats.get("rel_l2", 0.0)), 1.0e-12)
+                )
+                if float(no_rect_hit_stats.get("rel_l2", 0.0)) > 0.0
+                else 0.0
+            ),
+        }
+        _workflow_audit_record(row)
+    except Exception as exc:
+        _workflow_audit_record(
+            {
+                "time": time.time(),
+                "rank": _workflow_audit_rank(),
+                "pid": os.getpid(),
+                "layer_id": int(getattr(layer, "layer_id", -1)),
+                "error": repr(exc),
+            }
+        )
 
 
 def flashinfer_backend_init_after(
@@ -340,6 +869,16 @@ def flashinfer_init_forward_metadata_capture_cuda_graph_around(
 def flashinfer_init_forward_metadata_replay_cuda_graph_around(
     original_fn: Any, self: Any, *args: Any, **kwargs: Any
 ) -> Any:
+    # Graph replay skips all per-layer python, so the usual in-forward
+    # wait_for_cache_update() never runs. Order the whole replay after any
+    # pending prefill cache offloads here, on the compute stream.
+    try:
+        from .llama_hooks import iter_all_mac_metadata
+
+        for _md in iter_all_mac_metadata():
+            _md.wait_for_cache_update()
+    except Exception:
+        pass
     bs = args[0] if len(args) > 0 else kwargs.get("bs")
     forward_mode = args[5] if len(args) > 5 else kwargs.get("forward_mode")
     if _skip_flashinfer_replay_metadata_enabled() and bs is not None:
@@ -465,6 +1004,13 @@ def _is_torch_compiling() -> bool:
         except Exception:
             return False
     return False
+
+
+_EMPTY_CPU_TENSOR = torch.empty(0)
+
+
+def _empty_if_none(t: Optional[torch.Tensor]) -> torch.Tensor:
+    return t if t is not None else _EMPTY_CPU_TENSOR
 
 
 def _is_cuda_graph_capturing() -> bool:
@@ -1015,9 +1561,10 @@ def _ensure_persistent_workspace(backend: Any, metadata: Any, config: Any, batch
     tile = int(config.mac_persistent_tile_tokens)
     match_tile = int(config.mac_persistent_match_tile_slots)
     max_context = int(config.mac_persistent_max_context)
+    front_sink_tokens = max(int(getattr(config, "mac_front_sink_tokens", 0)), 0)
     max_match_tiles = _ceil_div(M, match_tile)
-    max_tiles_context = _ceil_div(max_context, tile)
-    max_tiles_reduce = _ceil_div(max_context, tile * 32)
+    max_tiles_context = _ceil_div(max_context, tile) + _ceil_div(front_sink_tokens, tile)
+    max_tiles_reduce = _ceil_div(max_tiles_context, 32)
     max_tiles_tail = max(1, _ceil_div(max(int(config.mac_semantic_pos_ahead), 1), tile))
     partial_o_dtype = torch.float32 if bool(config.mac_persistent_partial_fp32) else torch.bfloat16
     key = (
@@ -1031,6 +1578,7 @@ def _ensure_persistent_workspace(backend: Any, metadata: Any, config: Any, batch
         max_context,
         tile,
         match_tile,
+        front_sink_tokens,
         max_match_tiles,
         max_tiles_context,
         max_tiles_reduce,
@@ -1286,6 +1834,34 @@ def _try_persistent_decode(
         return None
     if int(q_input.shape[2]) != 128:
         return None
+    if _is_cuda_graph_capturing():
+        # Whatever is captured here replays for EVERY future decode step of
+        # this batch size with no python gating. The per-step max_kv_len
+        # check below sees only the dummy capture batch, so it cannot protect
+        # replay: unless the model's whole context range fits the persistent
+        # workspace, bake the FlashInfer path into the graph instead.
+        model_ctx = 0
+        try:
+            model_ctx = int(
+                getattr(
+                    getattr(getattr(backend, "model_runner", None), "model_config", None),
+                    "context_len",
+                    0,
+                )
+                or 0
+            )
+        except Exception:
+            model_ctx = 0
+        if model_ctx <= 0 or model_ctx > int(config.mac_persistent_max_context):
+            print(
+                "[mac_attention] persistent decode NOT captured into CUDA "
+                f"graph: model context_len={model_ctx} exceeds "
+                f"mac_persistent_max_context={int(config.mac_persistent_max_context)} "
+                "(or is unknown); raise MAC_PERSISTENT_MAX_CONTEXT to enable.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return None
     max_kv_len = int(getattr(metadata, "cur_kv_len", 0) or 0)
     if max_kv_len > int(config.mac_persistent_max_context):
         return None
@@ -1337,6 +1913,26 @@ def _try_persistent_decode(
     workspace = _ensure_persistent_workspace(backend, metadata, config, batch_size)
     out = torch.empty_like(q_input)
     optional_lse = torch.empty((0,), device=q_input.device, dtype=torch.float32)
+    query_post_cache = metadata.unified_query_post_cache
+    if query_post_cache is None:
+        query_post_cache = metadata.unified_query_cache.new_empty((0,))
+    backend.mac_last_persistent_audit = None
+    backend.mac_last_persistent_workspace = None
+    if (
+        _workflow_audit_enabled()
+        and _workflow_audit_no_rect_enabled()
+        and not _workflow_audit_limit_reached()
+        and not _is_cuda_graph_capturing()
+    ):
+        req_long = req_ids.long()
+        backend.mac_last_persistent_audit = {
+            "attn_cache_before": metadata.unified_attn_cache.index_select(
+                0, req_long
+            ).detach().clone(),
+            "lse_cache_before": metadata.unified_lse_cache.index_select(
+                0, req_long
+            ).detach().clone(),
+        }
     metadata.persistent_decode_ext.mac_persistent_decode_bf16(
         q_input,
         q_to_cache,
@@ -1385,6 +1981,7 @@ def _try_persistent_decode(
         int(config.mac_persistent_tile_tokens),
         int(config.mac_persistent_match_tile_slots),
         int(config.mac_semantic_pos_ahead),
+        int(getattr(config, "mac_front_sink_tokens", 0)),
         int(config.mac_gen_min_limit),
         int(config.mac_lookback_tokens_right),
         _candidate_mode_id(config.mac_persistent_candidate_mode),
@@ -1401,11 +1998,27 @@ def _try_persistent_decode(
         int(getattr(config, "mac_bench_seed", 1)),
         -1,
         int(getattr(layer, "layer_id", 0)),
+        query_post_cache,
+        # Device-side readiness gate: lets the kernel itself demote not-ready
+        # requests to pure full-fallback attention (and skip their cache-row
+        # writes). Required for CUDA-graph replay, where the python
+        # _persistent_ready gate does not run.
+        _empty_if_none(getattr(metadata, "mac_cache_ready", None)),
+        _empty_if_none(getattr(metadata, "mac_cache_epoch", None)),
+        _empty_if_none(getattr(metadata, "request_epoch", None)),
     )
-    if int(getattr(config, "mac_profile", 0) or 0):
+    # .item()-style host syncs invalidate CUDA-graph capture; the profile is
+    # meaningless for the dummy capture batch anyway.
+    if int(getattr(config, "mac_profile", 0) or 0) and not _is_cuda_graph_capturing():
         _update_persistent_decode_profile(metadata, workspace, batch_size, past_lens)
+        _log_persistent_decode_profile_snapshot(
+            metadata,
+            config,
+            int(getattr(layer, "layer_id", 0)),
+        )
     _log_persistent_debug_summary(backend, workspace, batch_size, layer, config)
     _maybe_eject_low_hit_persistent_cache(metadata, workspace, batch_size, req_ids, past_lens)
+    backend.mac_last_persistent_workspace = workspace
     return out
 
 
@@ -1589,6 +2202,20 @@ def _offload_fast_cache(
             f"num_token_non_padded={getattr(forward_batch, 'num_token_non_padded_cpu', None)} "
             f"starts={getattr(forward_batch, 'mac_prefill_cache_update_starts', None)}"
         )
+    if int(getattr(config, "mac_front_sink_tokens", 0)) > 0:
+        # Front-sink exclusion invariant: ring entries must cover exactly
+        # [min(F, E), E). Prefill rows are built sink-INCLUSIVE (full prefix
+        # minus the trailing band); subtracting the sink here would need a
+        # second ragged attention pass over [0, min(F, E)) per row. Until that
+        # is implemented, write prefill rows with -inf LSE so the decode
+        # scheduler's isfinite() validity check never accepts them as matches;
+        # decode-written entries take over as the ring turns. With the default
+        # MAC_GEN_MIN_LIMIT gating, prefill rows are unmatchable anyway for
+        # prompts shorter than the gate.
+        softmax_lse = torch.full_like(softmax_lse, float("-inf"))
+    q_post_cache_arg = mac_metadata.unified_query_post_cache
+    if q_post_cache_arg is None:
+        q_post_cache_arg = mac_metadata.unified_query_cache.new_empty((0,))
     mac_metadata.cache_ext.mac_prefill_update_cache(
         mac_metadata.unified_query_cache,
         mac_metadata.unified_attn_cache,
@@ -1603,6 +2230,7 @@ def _offload_fast_cache(
         config.mac_lookback_tokens_left,
         mac_metadata.num_heads,
         mac_metadata.head_dim,
+        q_post_cache_arg,
     )
 
 
@@ -2078,6 +2706,23 @@ def flashinfer_forward_decode_around(
         if graph_capture:
             _graph_trace(f"decode after persistent hit={persistent_out is not None}", layer)
         if persistent_out is not None:
+            _maybe_audit_persistent_decode(
+                original_fn=original_fn,
+                backend=self,
+                q=q,
+                k=k,
+                v=v,
+                layer=layer,
+                forward_batch=forward_batch,
+                kwargs=kwargs,
+                persistent_out=persistent_out,
+                q_input=q_input,
+                k_buffer=k_buffer,
+                v_buffer=v_buffer,
+                cache_loc=cache_loc,
+                mac_metadata=mac_metadata,
+                workspace=getattr(self, "mac_last_persistent_workspace", None),
+            )
             _record_decode_graph_capture(self, forward_batch, persistent=True)
             return persistent_out.view(-1, layer.tp_q_head_num * layer.head_dim)
         if graph_capture:
@@ -2133,8 +2778,25 @@ def flashinfer_forward_decode_around(
             v_buffer,
             cache_loc,
             layer,
-    )
+        )
     if persistent_out is not None:
+        _maybe_audit_persistent_decode(
+            original_fn=original_fn,
+            backend=self,
+            q=q,
+            k=k,
+            v=v,
+            layer=layer,
+            forward_batch=forward_batch,
+            kwargs=kwargs,
+            persistent_out=persistent_out,
+            q_input=q_input,
+            k_buffer=k_buffer,
+            v_buffer=v_buffer,
+            cache_loc=cache_loc,
+            mac_metadata=mac_metadata,
+            workspace=getattr(self, "mac_last_persistent_workspace", None),
+        )
         _record_decode_graph_capture(self, forward_batch, persistent=True)
         return persistent_out.view(-1, layer.tp_q_head_num * layer.head_dim)
     if graph_capture:
@@ -2237,6 +2899,11 @@ def flashinfer_forward_extend_around(
     )
     q = q.contiguous()
     q_input = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+    _mac_prefill_trace(
+        f"forward_extend enter q={tuple(q.shape)} q_input={tuple(q_input.shape)} "
+        f"save_kv_cache={save_kv_cache}",
+        layer,
+    )
 
     if not profiling_enabled():
         if k is not None:
@@ -2254,6 +2921,7 @@ def flashinfer_forward_extend_around(
         if _prefill_cache_update_required(
             forward_batch, mac_metadata.req_ids.numel(), q_input.shape[0]
         ):
+            _mac_prefill_trace("forward_extend before paged_forward_lse", layer)
             o, lse = prefill_wrapper_paged.forward_return_lse(
                 q_input,
                 (k_buffer, v_buffer),
@@ -2264,7 +2932,9 @@ def flashinfer_forward_extend_around(
                 k_scale=getattr(layer, "k_scale_float", None),
                 v_scale=getattr(layer, "v_scale_float", None),
             )
+            _mac_prefill_trace("forward_extend after paged_forward_lse", layer)
             lse = lse * math.log(2.0)
+            _mac_prefill_trace("forward_extend before cache_update", layer)
             _launch_prefill_cache_update_async(
                 self,
                 forward_batch,
@@ -2277,7 +2947,9 @@ def flashinfer_forward_extend_around(
                 lse,
                 layer,
             )
+            _mac_prefill_trace("forward_extend after cache_update", layer)
         else:
+            _mac_prefill_trace("forward_extend before paged_forward_no_lse", layer)
             o = prefill_wrapper_paged.forward(
                 q_input,
                 (k_buffer, v_buffer),
@@ -2288,6 +2960,7 @@ def flashinfer_forward_extend_around(
                 k_scale=getattr(layer, "k_scale_float", None),
                 v_scale=getattr(layer, "v_scale_float", None),
             )
+            _mac_prefill_trace("forward_extend after paged_forward_no_lse", layer)
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     if k is not None:

@@ -18,6 +18,7 @@ _FIELD_ENV_OVERRIDES = {
     "mac_lookback_tokens_right": ("MAC_LOOKBACK_TOKENS_RIGHT",),
     "mac_gen_min_limit": ("MAC_GEN_MIN_LIMIT",),
     "mac_semantic_pos_ahead": ("MAC_SEMANTIC_POS_AHEAD",),
+    "mac_front_sink_tokens": ("MAC_FRONT_SINK_TOKENS",),
     "mac_profile": ("MAC_PROFILE",),
     "mac_profile_path": ("MAC_PROFILE_PATH",),
     "mac_disable_cuda_graph": ("MAC_DISABLE_CUDA_GRAPH",),
@@ -89,6 +90,7 @@ def _normalize_values(values: dict[str, Any]) -> dict[str, Any]:
     values["mac_lookback_tokens_right"] = int(values["mac_lookback_tokens_right"])
     values["mac_gen_min_limit"] = int(values["mac_gen_min_limit"])
     values["mac_semantic_pos_ahead"] = int(values["mac_semantic_pos_ahead"])
+    values["mac_front_sink_tokens"] = int(values["mac_front_sink_tokens"])
     values["mac_profile"] = int(values["mac_profile"])
     values["mac_disable_cuda_graph"] = _to_bool(values["mac_disable_cuda_graph"])
     values["mac_force_paged_prefill"] = _to_bool(values["mac_force_paged_prefill"])
@@ -119,6 +121,9 @@ class MacSGLangConfig:
     mac_lookback_tokens_right: int = 0
     mac_gen_min_limit: int = 2048
     mac_semantic_pos_ahead: int = 256
+    # Extra front-of-context tokens recomputed on MAC hits. Zero preserves the
+    # original fixed-band-only rectification behavior.
+    mac_front_sink_tokens: int = 0
     mac_profile: int = 0
     mac_profile_path: str = ""
     mac_disable_cuda_graph: bool = True
@@ -235,6 +240,13 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=defaults.mac_gen_min_limit,
         help="Minimum cached context length before MAC decode matching is attempted.",
+    )
+    _add_argument_once(
+        parser,
+        "--mac-front-sink-tokens",
+        type=int,
+        default=defaults.mac_front_sink_tokens,
+        help="Number of front tokens additionally recomputed when MAC decode hits.",
     )
     _add_argument_once(
         parser,

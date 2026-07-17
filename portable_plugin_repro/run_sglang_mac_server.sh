@@ -14,7 +14,7 @@ if [[ -z "${MODEL_PATH:-}" ]]; then
 fi
 
 CUDA_GRAPH_ARGS=()
-if [[ "${MAC_DISABLE_CUDA_GRAPH:-1}" != "0" ]]; then
+if [[ "${MAC_DISABLE_CUDA_GRAPH:-0}" != "0" ]]; then
   CUDA_GRAPH_ARGS+=(--disable-cuda-graph)
 fi
 

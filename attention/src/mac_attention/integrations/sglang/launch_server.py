@@ -44,8 +44,20 @@ def _prefer_cuda_jit_backend() -> None:
         os.environ.setdefault("NVCC_PREPEND_FLAGS", f"-ccbin={gxx}")
 
 
+def _patch_torch_cpu_amx_probe() -> None:
+    try:
+        import torch
+
+        cpu_mod = getattr(torch._C, "_cpu", None)
+        if cpu_mod is not None and not hasattr(cpu_mod, "_is_amx_tile_supported"):
+            cpu_mod._is_amx_tile_supported = lambda: False
+    except Exception:
+        return
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     _prefer_cuda_jit_backend()
+    _patch_torch_cpu_amx_probe()
     config = install_env_config()
     installed = install_hooks()
     if os.environ.get("MAC_ATTENTION_SGLANG_DEBUG") == "1":
