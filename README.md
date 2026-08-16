@@ -1,3 +1,5 @@
+
+
 # <img src="assets/icon.png" height="48" style="vertical-align: -13px;"> MAC-Attention
 
 [![Paper](https://img.shields.io/badge/paper-arXiv%3A2604.00235-b31b1b.svg)](https://arxiv.org/abs/2604.00235)
@@ -122,6 +124,7 @@ benchmark mode): GQA-8 and GQA-4, batch 1, 16, and 64, contexts 32K–127K.
 
 | Dependency | Requirement |
 | --- | --- |
+| Python | Python >=3.10 |
 | GPU | NVIDIA GPU with BF16 support; H100-class hardware is the current validation target |
 | CUDA/PyTorch | CUDA-enabled PyTorch environment; current SGLang validation uses CUDA 13.0 |
 | Attention backend | `flashinfer-python` for FlashInfer baselines and SGLang's FlashInfer backend |
